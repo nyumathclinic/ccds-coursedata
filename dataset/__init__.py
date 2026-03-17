@@ -18,6 +18,7 @@ import typer
 from . import albert as _albert
 from . import brightspace as _brightspace
 from . import edstem as _edstem
+from . import engagement as _engagement
 from . import enrollment as _enrollment
 from . import gmail as _gmail
 from . import gradescope as _gradescope
@@ -94,6 +95,7 @@ def process_callback(ctx: typer.Context) -> None:
             ("enrollment rosters", _enrollment.process_all),
             ("gmail filters", _gmail.process_all),
         ]
+        commands.append(("engagement scores", _engagement.process_all))
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -140,6 +142,34 @@ def process_gmail_filters(
 
 app.add_typer(process_app, name="process")
 
+
+@process_app.command("engagement")
+def process_engagement_cmd(
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Output CSV path (overrides configured output_path)."),
+    ] = None,
+    keep_source_columns: Annotated[
+        Optional[bool],
+        typer.Option("--keep-source-cols/--no-source-cols", help="Include per-source columns in output."),
+    ] = None,
+    report: Annotated[
+        bool,
+        typer.Option("--report/--no-report", help="Print and save a validation report."),
+    ] = True,
+    report_dir: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory for report files (overrides configured report_path)."),
+    ] = None,
+) -> None:
+    """Compute engagement scores and save to PROCESSED_DATA_DIR."""
+    _engagement._process_impl(
+        output_path=output,
+        keep_source_columns=keep_source_columns,
+        with_report=report,
+        report_dir=report_dir,
+    )
+
 # ---------------------------------------------------------------------------
 # report group
 # ---------------------------------------------------------------------------
@@ -157,6 +187,7 @@ def report_callback(ctx: typer.Context) -> None:
         commands = [
             ("enrollment reports", _enrollment.report_all),
         ]
+        commands.append(("engagement report", _engagement.report_all))
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -183,6 +214,17 @@ def report_enrollment(
 
 
 app.add_typer(report_app, name="report")
+
+
+@report_app.command("engagement")
+def report_engagement_cmd(
+    report_dir: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory for report files (overrides configured report_path)."),
+    ] = None,
+) -> None:
+    """Re-compute engagement and emit a validation report without saving a CSV."""
+    _engagement._report_impl(report_dir=report_dir)
 
 # ---------------------------------------------------------------------------
 # daily command
@@ -213,9 +255,11 @@ def daily(
     logger.info("Running daily pipeline: process phase")
     _enrollment.process_all()
     _gmail.process_all()
+    _engagement.process_all()
 
     logger.info("Running daily pipeline: report phase")
     _enrollment.report_all()
+    _engagement.report_all()
 
     logger.success("Daily pipeline complete.")
 
