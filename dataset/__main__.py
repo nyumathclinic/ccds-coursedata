@@ -1,6 +1,6 @@
-"""Entry point for ``python -m dataset``."""
+"""Entry point for ``python -m coursedata.dataset``."""
 
-from dataset import app
+from . import app
 
 if __name__ == "__main__":
     app()
