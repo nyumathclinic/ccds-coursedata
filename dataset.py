@@ -15,6 +15,12 @@ try:
 except ImportError:
     EDUBAG_AVAILABLE = False
 
+try:
+    from edubag.edstem.client import EdstemClient
+    EDSTEM_AVAILABLE = True
+except ImportError:
+    EDSTEM_AVAILABLE = False
+
 # Brightspace client availability is independent of Albert
 try:
     from edubag.brightspace.client import BrightspaceClient
@@ -35,6 +41,7 @@ from coursedata.config import (
     TERM_NAME,
     GRADESCOPE_CONFIG,
     BRIGHTSPACE_CONFIG,
+    EDSTEM_CONFIG,
 )
 from coursedata.enrollment import (
     find_roster_files,
@@ -78,6 +85,7 @@ def daily():
     albert_rosters()
     albert_class_details()
     gradescope_rosters()
+    edstem_analytics()
     save_gmail_filters()
     enrollment_rosters()
     enrollment_reports()
@@ -465,6 +473,81 @@ def gradescope_rosters(
             logger.error(f"Failed to fetch roster for course {course}: {e}")
             raise typer.Exit(code=1)
     logger.success("Gradescope rosters fetched successfully.")
+
+
+@app.command()
+def edstem_analytics(
+    output_dir: Annotated[
+        Path | None, typer.Option(help="Output directory for EdStem analytics")
+    ] = None,
+    clean: Annotated[
+        bool,
+        typer.Option(
+            help="Remove existing files in output directories before fetching"
+        ),
+    ] = False,
+):
+    """
+    Fetch EdStem analytics for configured courses and save to output_dir.
+    """
+    if not EDSTEM_AVAILABLE:
+        logger.error("edubag edstem client is not available. Cannot fetch EdStem analytics.")
+        raise typer.Exit(code=1)
+
+    course_ids = EDSTEM_CONFIG.get("courses", [])
+    if not course_ids:
+        logger.error("No EdStem course IDs found in configuration.")
+        raise typer.Exit(code=1)
+
+    if output_dir is None:
+        output_dir = RAW_DATA_DIR / "edstem" / "analytics" / d8
+
+    # Clean output directory if requested
+    if clean and output_dir.exists():
+        logger.info(f"Cleaning output directory: {output_dir}")
+        shutil.rmtree(output_dir)
+
+    logger.info(
+        f"Fetching EdStem analytics for courses {course_ids} to '{output_dir}'"
+    )
+
+    # Get credentials from environment and keychain
+    username = os.getenv("EDSTEM_USERNAME")
+    if not username:
+        logger.warning(
+            "EDSTEM_USERNAME not found in environment variables. Set it in your .env file."
+        )
+        username = None
+
+    password = None
+    if username:
+        password = get_password("edstem.org", username)
+        if not password:
+            logger.warning(
+                f"Password for user '{username}' not found in macOS Keychain. Store it with: security add-generic-password -s edstem.org -a {username} -w YOUR_PASSWORD"
+            )
+            password = None
+
+    # Authenticate once for the session
+    try:
+        client = EdstemClient()
+        client.authenticate(username=username, password=password, headless=True)
+    except Exception as e:
+        logger.error(f"EdStem authentication failed: {e}")
+        raise typer.Exit(code=1)
+
+    # Download analytics per course
+    for course in course_ids:
+        try:
+            client.save_analytics(
+                course,
+                save_dir=output_dir,
+                headless=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch analytics for course {course}: {e}")
+            raise typer.Exit(code=1)
+    logger.success("EdStem analytics fetched successfully.")
 
 
 @app.command()
