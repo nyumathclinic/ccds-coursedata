@@ -120,6 +120,7 @@ except ImportError:
 
 from coursedata.config import (
     ENGAGEMENT_CONFIG,
+    INTERIM_DATA_DIR,
     PROCESSED_DATA_DIR,
     RAW_DATA_DIR,
     REPORTS_DIR,
@@ -805,7 +806,23 @@ def _process_impl(
     # ------------------------------------------------------------------ #
     if save_csv:
         assert output_path is not None
-        output_gb = aggregator.to_gradebook(keep_source_columns=bool(keep_source_columns))
+        full_output_gb = aggregator.to_gradebook(keep_source_columns=True)
+
+        try:
+            rel_output_path = output_path.relative_to(PROCESSED_DATA_DIR)
+        except ValueError:
+            rel_output_path = Path(output_path.name)
+
+        interim_output_path = INTERIM_DATA_DIR / rel_output_path
+        interim_output_path.parent.mkdir(parents=True, exist_ok=True)
+        full_output_gb.to_csv(interim_output_path)
+        logger.info(f"Wrote full engagement dataframe → {interim_output_path}")
+
+        output_gb = (
+            full_output_gb
+            if bool(keep_source_columns)
+            else aggregator.to_gradebook(keep_source_columns=False)
+        )
 
         keep_only = ENGAGEMENT_CONFIG.get("keep_only_engagement_columns", False)
         if keep_only:

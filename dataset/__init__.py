@@ -21,6 +21,7 @@ from . import edstem as _edstem
 from . import engagement as _engagement
 from . import enrollment as _enrollment
 from . import gmail as _gmail
+from . import progress as _progress
 from . import gradescope as _gradescope
 
 app = typer.Typer(
@@ -96,6 +97,7 @@ def process_callback(ctx: typer.Context) -> None:
             ("gmail filters", _gmail.process_all),
         ]
         commands.append(("engagement scores", _engagement.process_all))
+        commands.append(("midterm progress report", _progress.process_all))
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -169,6 +171,17 @@ def process_engagement_cmd(
         with_report=report,
         report_dir=report_dir,
     )
+
+
+@process_app.command("midterm-progress")
+def process_midterm_progress_cmd(
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Output CSV path override."),
+    ] = None,
+) -> None:
+    """Generate a syllabus-aligned midterm progress report CSV."""
+    _progress._build_midterm_progress_report(output_path=output)
 
 # ---------------------------------------------------------------------------
 # report group
@@ -256,6 +269,7 @@ def daily(
     _enrollment.process_all()
     _gmail.process_all()
     _engagement.process_all()
+    _progress.process_all()
 
     logger.info("Running daily pipeline: report phase")
     _enrollment.report_all()

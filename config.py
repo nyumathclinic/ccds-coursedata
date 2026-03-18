@@ -30,6 +30,7 @@ GRADESCOPE_CONFIG = _config.get("gradescope", {})
 BRIGHTSPACE_CONFIG = _config.get("brightspace", {})
 EDSTEM_CONFIG = _config.get("edstem", {})
 ENGAGEMENT_CONFIG = _config.get("engagement", {})
+PROGRESS_REPORT_CONFIG = _config.get("progress_report", {})
 
 # Course Information
 try:
