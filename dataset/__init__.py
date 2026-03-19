@@ -17,12 +17,13 @@ import typer
 
 from . import albert as _albert
 from . import brightspace as _brightspace
+from . import drive as _drive
 from . import edstem as _edstem
 from . import engagement as _engagement
 from . import enrollment as _enrollment
 from . import gmail as _gmail
-from . import progress as _progress
 from . import gradescope as _gradescope
+from . import progress as _progress
 
 app = typer.Typer(
     help="Course data management CLI.",
@@ -57,6 +58,7 @@ def get_callback(
         sources = [
             ("albert", _albert.run_all),
             ("brightspace", _brightspace.run_all),
+            ("drive", _drive.run_all),
             ("gradescope", _gradescope.run_all),
             ("edstem", _edstem.run_all),
         ]
@@ -73,6 +75,7 @@ def get_callback(
 
 get_app.add_typer(_albert.app, name="albert")
 get_app.add_typer(_brightspace.app, name="brightspace")
+get_app.add_typer(_drive.app, name="drive")
 get_app.add_typer(_gradescope.app, name="gradescope")
 get_app.add_typer(_edstem.app, name="edstem")
 
@@ -259,6 +262,7 @@ def daily(
     for name, run_fn in [
         ("albert", _albert.run_all),
         ("brightspace", _brightspace.run_all),
+        ("drive", _drive.run_all),
         ("gradescope", _gradescope.run_all),
         ("edstem", _edstem.run_all),
     ]:
