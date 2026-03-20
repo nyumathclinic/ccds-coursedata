@@ -561,13 +561,20 @@ def _add_configured_denominators(
 # =========================================================================== #
 
 
+def _needs_formula_quoting(term: str) -> bool:
+    """Return ``True`` when *term* is not a valid bare Python identifier."""
+    return re.match(r"^[A-Za-z_]\w*$", term) is None
+
+
 def _as_formula_term(term: str) -> str:
-    """Wrap a numerator term in backticks when it contains hyphens.
+    """Wrap a numerator term in backticks when it needs formula quoting.
 
     The :class:`~edubag.aggregator.EngagementAggregator` uses backtick
     notation to handle column names that are not valid Python identifiers.
-    This function auto-wraps bare column names (e.g. ``Pre-Quizzes_positive``)
-    while leaving arithmetic expressions (e.g. ``2*Answers``) unchanged.
+    This function auto-wraps bare column names with spaces, hyphens, or other
+    identifier-breaking characters (e.g. ``Pre-Quizzes_positive`` or
+    ``Problem Sets_positive``) while leaving arithmetic expressions
+    (e.g. ``2*Answers``) unchanged.
     """
     term = term.strip()
     if term.startswith("`"):  # already quoted
@@ -575,15 +582,15 @@ def _as_formula_term(term: str) -> str:
     # Expressions with operators (other than a single leading coefficient)
     if re.search(r"[+/()\[\]]", term):
         return term
-    # "2*ColName" — only quote the column part if it has hyphens
+    # "2*ColName" — only quote the column part if it needs formula quoting
     m = re.match(r"^([\d.]+\s*\*\s*)(.+)$", term)
     if m:
         coeff, col = m.group(1), m.group(2).strip()
-        if "-" in col:
+        if _needs_formula_quoting(col):
             return f"{coeff}`{col}`"
         return term
-    # Plain column name with hyphens
-    if "-" in term:
+    # Plain column name with spaces, hyphens, or other special characters
+    if _needs_formula_quoting(term):
         return f"`{term}`"
     return term
 
