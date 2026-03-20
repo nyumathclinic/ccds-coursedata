@@ -326,7 +326,7 @@ def _load_source(
                 for col in category_cols:
                     series = source.grades[col]
                     normalized = series.astype(str).str.strip().str.lower()
-                    is_blank = normalized.isin({"", "nan", "none", "-"})
+                    is_blank = series.isna() | normalized.isin({"", "nan", "none", "-"})
                     if not is_blank.all():
                         active_cols.append(col)
 
