@@ -28,6 +28,11 @@ dependencies = [
     "python-dotenv",
     "ruff",
     "scikit-learn",
+    "keyring",
+    "reportlab",
+# Since this module is still in development
+# install with `uv pip install ../python-edubag`
+#    "python-edubag @ git+https://github.com/nyumathclinic/python-edubag.git"
 ]
 requires-python = "~=3.13.0"
 
