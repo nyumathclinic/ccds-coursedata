@@ -57,7 +57,7 @@ Manage and report on data for a course in a semester
     └── plots.py                <- Code to create visualizations
 ```
 
-## Usage
+## Installation
 
 Create a course-semester ccds project and import this as a submodule.
 
@@ -73,6 +73,18 @@ git add coursedata
 git commit -m "Add coursedata submodule"
 git push
 ```
+
+### Installation
+
+In the top (course-semester) repository, run:
+
+```bash
+uv pip install -e generic
+uv pip install ../python-edubag
+uv run python -m playwright install
+```
+
+## Usage
 
 ### Make changes in coursedata and publish them
 All changes to the submodule live in its own repository. From inside `generic/`:
