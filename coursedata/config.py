@@ -7,8 +7,23 @@ from loguru import logger
 # Load environment variables from .env file if it exists
 load_dotenv()
 
+def _find_project_root() -> Path:
+    """Locate the project root containing pyproject.toml with [tool.coursedata]."""
+
+    package_root = Path(__file__).resolve().parents[1]
+
+    # Prefer the current working tree so submodule package code can be reused by parent repos.
+    for candidate in [Path.cwd(), *Path.cwd().parents]:
+        pyproject = candidate / "pyproject.toml"
+        if pyproject.exists():
+            return candidate
+
+    # Fallback for running inside the generic package repository directly.
+    return package_root
+
+
 # Load configuration from pyproject.toml
-PROJ_ROOT = Path(__file__).resolve().parents[1]
+PROJ_ROOT = _find_project_root()
 
 if sys.version_info >= (3, 11):
     import tomllib
