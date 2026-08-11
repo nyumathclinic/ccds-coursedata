@@ -61,10 +61,10 @@ Manage and report on data for a course in a semester
 
 Create a course-semester ccds project and import this as a submodule.
 
-### Add as a submodule
+### Add generic course data as a submodule
 1) From the parent repo root:
 ```bash
-git submodule add https://github.com/leingang/ccds-coursedata.git generic
+git submodule add https://github.com/nyumathclinic/ccds-coursedata.git generic
 git submodule update --init --recursive
 ```
 2) Commit the submodule pointer in the parent:
