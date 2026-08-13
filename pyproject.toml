@@ -30,6 +30,7 @@ dependencies = [
     "scikit-learn",
     "keyring",
     "reportlab",
+    "nyu-colors @ git+https://github.com/nyumathclinic/nyu-colors.git@v1.0.0"
 # Since this module is still in development
 # install with `uv pip install ../python-edubag`
 #    "python-edubag @ git+https://github.com/nyumathclinic/python-edubag.git"

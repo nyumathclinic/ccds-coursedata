@@ -47,6 +47,7 @@ EDSTEM_CONFIG = _config.get("edstem", {})
 DRIVE_CONFIG = _config.get("drive", {})
 ENGAGEMENT_CONFIG = _config.get("engagement", {})
 PROGRESS_REPORT_CONFIG = _config.get("progress_report", {})
+SECTIONS_DASHBOARD_CONFIG = _config.get("sections_dashboard", {})
 
 # Course Information
 try:

@@ -1,0 +1,58 @@
+:root {
+  --nyu-violet: #57068c;
+  --nyu-deep-violet: #330662;
+  --nyu-light-violet: #eee6f3;
+  --nyu-light-gray: #f2f2f2;
+  --nyu-mid-gray: #b8b8b8;
+  --nyu-white: #ffffff;
+}
+
+body {
+  background-color: var(--nyu-light-gray);
+  color: var(--nyu-deep-violet);
+}
+
+.navbar,
+.navbar-default {
+  background: linear-gradient(120deg, var(--nyu-violet), var(--nyu-deep-violet));
+  border-color: var(--nyu-deep-violet);
+}
+
+.navbar-default .navbar-brand,
+.navbar-default .navbar-nav > li > a {
+  color: var(--nyu-white);
+}
+
+.navbar-default .navbar-nav > li > a:hover,
+.navbar-default .navbar-brand:hover {
+  color: var(--nyu-light-violet);
+}
+
+.wy-side-nav-search,
+.bs-sidebar {
+  background: var(--nyu-light-violet);
+}
+
+a {
+  color: var(--nyu-violet);
+}
+
+a:hover,
+a:focus {
+  color: var(--nyu-deep-violet);
+}
+
+code,
+pre {
+  border-radius: 4px;
+}
+
+.table,
+table {
+  background: var(--nyu-white);
+  border-color: var(--nyu-mid-gray);
+}
+
+th {
+  background: var(--nyu-light-violet);
+}

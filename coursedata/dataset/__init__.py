@@ -23,7 +23,14 @@ from . import engagement as _engagement
 from . import enrollment as _enrollment
 from . import gmail as _gmail
 from . import gradescope as _gradescope
-from . import progress as _progress
+from . import sections as _sections
+
+try:
+    from . import progress as _progress
+    _PROGRESS_AVAILABLE = True
+except ImportError as exc:
+    _PROGRESS_AVAILABLE = False
+    _PROGRESS_IMPORT_ERROR = exc
 
 app = typer.Typer(
     help="Course data management CLI.",
@@ -100,7 +107,13 @@ def process_callback(ctx: typer.Context) -> None:
             ("gmail filters", _gmail.process_all),
         ]
         commands.append(("engagement scores", _engagement.process_all))
-        commands.append(("midterm progress report", _progress.process_all))
+        if _PROGRESS_AVAILABLE:
+            commands.append(("midterm progress report", _progress.process_all))
+        else:
+            logger.warning(
+                f"Skipping midterm progress command because dependencies are missing: {_PROGRESS_IMPORT_ERROR}"
+            )
+        commands.append(("sections dashboard dataset", _sections.process_all))
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -184,7 +197,27 @@ def process_midterm_progress_cmd(
     ] = None,
 ) -> None:
     """Generate a syllabus-aligned midterm progress report CSV."""
+    if not _PROGRESS_AVAILABLE:
+        logger.error(
+            f"midterm-progress command is unavailable because dependencies are missing: {_PROGRESS_IMPORT_ERROR}"
+        )
+        raise typer.Exit(code=1)
     _progress._build_midterm_progress_report(output_path=output)
+
+
+@process_app.command("sections")
+def process_sections_cmd(
+    input_path: Annotated[
+        Optional[Path],
+        typer.Option("--input", help="Path to class_details JSON file or directory"),
+    ] = None,
+    output_dir: Annotated[
+        Optional[Path],
+        typer.Option("--output-dir", help="Output directory for canonical sections files"),
+    ] = None,
+) -> None:
+    """Build canonical sections CSV/JSON from Albert class details."""
+    _sections._process_impl(input_path=input_path, output_dir=output_dir)
 
 # ---------------------------------------------------------------------------
 # report group
@@ -204,6 +237,7 @@ def report_callback(ctx: typer.Context) -> None:
             ("enrollment reports", _enrollment.report_all),
         ]
         commands.append(("engagement report", _engagement.report_all))
+        commands.append(("sections dashboard report", _sections.report_all))
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -242,6 +276,21 @@ def report_engagement_cmd(
     """Re-compute engagement and emit a validation report without saving a CSV."""
     _engagement._report_impl(report_dir=report_dir)
 
+
+@report_app.command("sections")
+def report_sections_cmd(
+    processed_json: Annotated[
+        Optional[Path],
+        typer.Option("--processed-json", help="Path to canonical sections JSON file"),
+    ] = None,
+    output_dir: Annotated[
+        Optional[Path],
+        typer.Option("--output-dir", help="Output directory for sections report artifacts"),
+    ] = None,
+) -> None:
+    """Generate sections dashboard HTML and summary report."""
+    _sections._reports_impl(processed_json_path=processed_json, output_dir=output_dir)
+
 # ---------------------------------------------------------------------------
 # daily command
 # ---------------------------------------------------------------------------
@@ -273,11 +322,18 @@ def daily(
     _enrollment.process_all()
     _gmail.process_all()
     _engagement.process_all()
-    _progress.process_all()
+    if _PROGRESS_AVAILABLE:
+        _progress.process_all()
+    else:
+        logger.warning(
+            f"Skipping midterm progress processing because dependencies are missing: {_PROGRESS_IMPORT_ERROR}"
+        )
+    _sections.process_all()
 
     logger.info("Running daily pipeline: report phase")
     _enrollment.report_all()
     _engagement.report_all()
+    _sections.report_all()
 
     logger.success("Daily pipeline complete.")
 

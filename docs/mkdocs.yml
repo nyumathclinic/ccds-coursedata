@@ -2,3 +2,9 @@ site_name: coursedata
 # 
 site_author: Matthew Leingang
 # 
+extra_css:
+  - stylesheets/nyu.css
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Sections Dashboard Workflow: sections-dashboard-workflow.md
