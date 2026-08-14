@@ -56,7 +56,12 @@ def _rosters_impl(
 
     client = AlbertClient()
     xls_path_list = client.fetch_and_save_rosters(
-        COURSE_NAME, TERM_NAME, output_dir, username=username, password=password
+        COURSE_NAME,
+        TERM_NAME,
+        output_dir,
+        username=username,
+        password=password,
+        headless=headless,
     )
     logger.success("Rosters fetched successfully.")
     if convert_to_csv:
@@ -87,7 +92,12 @@ def _class_details_impl(
 
     client = AlbertClient()
     client.fetch_class_details(
-        COURSE_NAME, TERM_NAME, output=output, username=username, password=password
+        COURSE_NAME,
+        TERM_NAME,
+        output=output,
+        username=username,
+        password=password,
+        headless=headless,
     )
     logger.success("Class details fetched successfully.")
 
