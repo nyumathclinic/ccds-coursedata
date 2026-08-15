@@ -48,6 +48,7 @@ DRIVE_CONFIG = _config.get("drive", {})
 ENGAGEMENT_CONFIG = _config.get("engagement", {})
 PROGRESS_REPORT_CONFIG = _config.get("progress_report", {})
 SECTIONS_DASHBOARD_CONFIG = _config.get("sections_dashboard", {})
+DAILY_CONFIG = _config.get("daily", {})
 
 # Course Information
 try:

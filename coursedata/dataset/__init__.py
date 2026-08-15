@@ -14,6 +14,7 @@ from typing import Annotated, Optional
 from loguru import logger
 from rich.progress import Progress, SpinnerColumn, TextColumn
 import typer
+from coursedata.config import DAILY_CONFIG
 
 from . import albert as _albert
 from . import brightspace as _brightspace
@@ -306,36 +307,77 @@ def daily(
         ),
     ] = False,
 ) -> None:
-    """Run all daily data processing steps (get + process + report)."""
-    logger.info("Running daily pipeline: get phase")
-    for name, run_fn in [
-        ("albert", _albert.run_all),
-        ("brightspace", _brightspace.run_all),
-        ("drive", _drive.run_all),
-        ("gradescope", _gradescope.run_all),
-        ("edstem", _edstem.run_all),
-    ]:
-        logger.info(f"  → get {name}")
-        run_fn(headless=headless)
+    """Run configured daily data processing steps.
 
-    logger.info("Running daily pipeline: process phase")
-    _enrollment.process_all()
-    _gmail.process_all()
-    _engagement.process_all()
-    if _PROGRESS_AVAILABLE:
-        _progress.process_all()
-    else:
-        logger.warning(
-            f"Skipping midterm progress processing because dependencies are missing: {_PROGRESS_IMPORT_ERROR}"
+    Configure step order in ``[tool.coursedata.daily].dataset`` in ``pyproject.toml``.
+    """
+
+    def _process_midterm_progress() -> None:
+        if _PROGRESS_AVAILABLE:
+            _progress.process_all()
+        else:
+            logger.warning(
+                "Skipping process.midterm-progress because dependencies are missing: "
+                f"{_PROGRESS_IMPORT_ERROR}"
+            )
+
+    step_handlers = {
+        "get.albert": lambda: _albert.run_all(headless=headless),
+        "get.brightspace": lambda: _brightspace.run_all(headless=headless),
+        "get.drive": lambda: _drive.run_all(headless=headless),
+        "get.gradescope": lambda: _gradescope.run_all(headless=headless),
+        "get.edstem": lambda: _edstem.run_all(headless=headless),
+        "process.enrollment": _enrollment.process_all,
+        "process.gmail-filters": _gmail.process_all,
+        "process.engagement": _engagement.process_all,
+        "process.midterm-progress": _process_midterm_progress,
+        "process.sections": _sections.process_all,
+        "report.enrollment": _enrollment.report_all,
+        "report.engagement": _engagement.report_all,
+        "report.sections": _sections.report_all,
+    }
+
+    default_steps = [
+        "get.albert",
+        "get.brightspace",
+        "get.drive",
+        "get.gradescope",
+        "get.edstem",
+        "process.enrollment",
+        "process.gmail-filters",
+        "process.engagement",
+        "process.midterm-progress",
+        "process.sections",
+        "report.enrollment",
+        "report.engagement",
+        "report.sections",
+    ]
+
+    configured_steps = DAILY_CONFIG.get("dataset")
+    if configured_steps is None:
+        steps = default_steps
+    elif not isinstance(configured_steps, list) or not all(
+        isinstance(step, str) for step in configured_steps
+    ):
+        logger.error(
+            "Invalid [tool.coursedata.daily].dataset config. Expected a list of step names."
         )
-    _sections.process_all()
+        raise typer.Exit(code=1)
+    else:
+        steps = [step.strip() for step in configured_steps if step.strip()]
 
-    logger.info("Running daily pipeline: report phase")
-    _enrollment.report_all()
-    _engagement.report_all()
-    _sections.report_all()
+    unknown_steps = [step for step in steps if step not in step_handlers]
+    if unknown_steps:
+        logger.error(f"Unknown dataset daily steps: {unknown_steps}")
+        logger.error(f"Allowed steps: {sorted(step_handlers)}")
+        raise typer.Exit(code=1)
 
-    logger.success("Daily pipeline complete.")
+    logger.info("Running dataset daily pipeline")
+    for step in steps:
+        logger.info(f"  -> {step}")
+        step_handlers[step]()
+
+    logger.success("Dataset daily pipeline complete.")
 
 
 # ---------------------------------------------------------------------------

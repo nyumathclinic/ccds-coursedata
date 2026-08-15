@@ -34,6 +34,7 @@ except ImportError:
 from coursedata.config import (
     COURSE_NAME,
     TERM_NAME,
+    DAILY_CONFIG,
     GRADESCOPE_CONFIG,
     RAW_DATA_DIR,
     PROCESSED_DATA_DIR,
@@ -462,12 +463,41 @@ def sync_gradescope_sections(
 
 @app.command()
 def daily():
-    """Run all non-data local tasks for the day.
+    """Run configured local tasks for the day.
 
-    Currently runs Gradescope roster sync; add additional tasks here as needed.
+    Configure step order in ``[tool.coursedata.daily].tasks`` in ``pyproject.toml``.
     """
-    # Uses defaults from configuration and environment
-    sync_gradescope_rosters()
+    step_handlers = {
+        "sync-gradescope-rosters": sync_gradescope_rosters,
+        "sync-gradescope-sections": sync_gradescope_sections,
+    }
+    default_steps = ["sync-gradescope-rosters"]
+
+    configured_steps = DAILY_CONFIG.get("tasks")
+    if configured_steps is None:
+        steps = default_steps
+    elif not isinstance(configured_steps, list) or not all(
+        isinstance(step, str) for step in configured_steps
+    ):
+        logger.error(
+            "Invalid [tool.coursedata.daily].tasks config. Expected a list of step names."
+        )
+        raise typer.Exit(code=1)
+    else:
+        steps = [step.strip() for step in configured_steps if step.strip()]
+
+    unknown_steps = [step for step in steps if step not in step_handlers]
+    if unknown_steps:
+        logger.error(f"Unknown tasks daily steps: {unknown_steps}")
+        logger.error(f"Allowed steps: {sorted(step_handlers)}")
+        raise typer.Exit(code=1)
+
+    logger.info("Running tasks daily pipeline")
+    for step in steps:
+        logger.info(f"  -> {step}")
+        step_handlers[step]()
+
+    logger.success("Tasks daily pipeline complete.")
 
 
 if __name__ == "__main__":
