@@ -43,6 +43,7 @@ if tomllib:
 LECTURE_COVERS_CONFIG = _config.get("lecture_covers", {})
 GRADESCOPE_CONFIG = _config.get("gradescope", {})
 BRIGHTSPACE_CONFIG = _config.get("brightspace", {})
+ALBERT_CONFIG = _config.get("albert", {})
 EDSTEM_CONFIG = _config.get("edstem", {})
 DRIVE_CONFIG = _config.get("drive", {})
 ENGAGEMENT_CONFIG = _config.get("engagement", {})

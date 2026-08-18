@@ -1,5 +1,6 @@
 """Albert CLI commands for ``dataset get albert``."""
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -16,10 +17,27 @@ try:
 except ImportError:
     EDUBAG_AVAILABLE = False
 
-from coursedata.config import COURSE_NAME, INTERIM_DATA_DIR, RAW_DATA_DIR, TERM_NAME
+from coursedata.config import ALBERT_CONFIG, COURSE_NAME, INTERIM_DATA_DIR, RAW_DATA_DIR, TERM_NAME
 from ._utils import d8, get_password, get_sso_credentials
 
 app = typer.Typer(help="Fetch data from Albert.")
+
+
+def _albert_course_ids_and_term() -> tuple[Optional[list], str]:
+    """Read per-course config from [tool.coursedata.albert] in pyproject.toml."""
+    course_ids = ALBERT_CONFIG.get("courses")
+    term = ALBERT_CONFIG.get("term_number") or TERM_NAME
+    return course_ids, term
+
+
+def _require_instructor_id() -> str:
+    instructor_id = os.environ.get("ALBERT_INSTRUCTOR_ID")
+    if not instructor_id:
+        logger.error(
+            "ALBERT_INSTRUCTOR_ID environment variable must be set to fetch by individual course number."
+        )
+        raise typer.Exit(code=1)
+    return instructor_id
 
 
 def _rosters_impl(
@@ -48,21 +66,39 @@ def _rosters_impl(
             logger.info(f"Cleaning CSV output directory: {csv_output_dir}")
             shutil.rmtree(csv_output_dir)
 
-    logger.info(
-        f"Fetching rosters for course '{COURSE_NAME}' in term '{TERM_NAME}' to '{output_dir}'"
-    )
-
     username, password = get_sso_credentials()
-
     client = AlbertClient()
-    xls_path_list = client.fetch_and_save_rosters(
-        COURSE_NAME,
-        TERM_NAME,
-        output_dir,
-        username=username,
-        password=password,
-        headless=headless,
-    )
+
+    course_ids, term = _albert_course_ids_and_term()
+    if course_ids:
+        instructor_id = _require_instructor_id()
+        logger.info(
+            f"Fetching rosters for courses {course_ids} in term '{term}' to '{output_dir}'"
+        )
+        xls_path_list = [
+            client.fetch_roster(
+                class_number,
+                term,
+                instructor_id=instructor_id,
+                save_dir=output_dir,
+                username=username,
+                password=password,
+                headless=headless,
+            )
+            for class_number in tqdm(course_ids, desc="Fetching rosters")
+        ]
+    else:
+        logger.info(
+            f"Fetching rosters for course '{COURSE_NAME}' in term '{TERM_NAME}' to '{output_dir}'"
+        )
+        xls_path_list = client.fetch_and_save_rosters(
+            COURSE_NAME,
+            TERM_NAME,
+            output_dir,
+            username=username,
+            password=password,
+            headless=headless,
+        )
     logger.success("Rosters fetched successfully.")
     if convert_to_csv:
         csv_output_dir.mkdir(parents=True, exist_ok=True)
@@ -84,21 +120,41 @@ def _class_details_impl(
     if output is None:
         output = RAW_DATA_DIR / "albert" / "class_details" / d8 / "class_details.json"
 
-    logger.info(
-        f"Fetching class details for course '{COURSE_NAME}' in term '{TERM_NAME}' to '{output}'"
-    )
-
     username, password = get_sso_credentials()
-
     client = AlbertClient()
-    client.fetch_class_details(
-        COURSE_NAME,
-        TERM_NAME,
-        output=output,
-        username=username,
-        password=password,
-        headless=headless,
-    )
+
+    course_ids, term = _albert_course_ids_and_term()
+    if course_ids:
+        instructor_id = _require_instructor_id()
+        logger.info(
+            f"Fetching class details for courses {course_ids} in term '{term}' to '{output}'"
+        )
+        details = [
+            client.fetch_course_details(
+                class_number,
+                term,
+                instructor_id=instructor_id,
+                username=username,
+                password=password,
+                headless=headless,
+            )
+            for class_number in tqdm(course_ids, desc="Fetching class details")
+        ]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with open(output, "w") as f:
+            json.dump(details, f, indent=2)
+    else:
+        logger.info(
+            f"Fetching class details for course '{COURSE_NAME}' in term '{TERM_NAME}' to '{output}'"
+        )
+        client.fetch_class_details(
+            COURSE_NAME,
+            TERM_NAME,
+            output=output,
+            username=username,
+            password=password,
+            headless=headless,
+        )
     logger.success("Class details fetched successfully.")
 
 
