@@ -305,7 +305,7 @@ def daily(
             "--headless/--headed",
             help="Run browser headless (for automation) or headed (for debugging).",
         ),
-    ] = False,
+    ] = True,
 ) -> None:
     """Run configured daily data processing steps.
 
