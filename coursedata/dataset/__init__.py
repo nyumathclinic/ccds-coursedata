@@ -18,6 +18,7 @@ from coursedata.config import DAILY_CONFIG
 
 from . import albert as _albert
 from . import brightspace as _brightspace
+from . import calendars as _calendars
 from . import drive as _drive
 from . import edstem as _edstem
 from . import engagement as _engagement
@@ -28,6 +29,7 @@ from . import sections as _sections
 
 try:
     from . import progress as _progress
+
     _PROGRESS_AVAILABLE = True
 except ImportError as exc:
     _PROGRESS_AVAILABLE = False
@@ -115,6 +117,7 @@ def process_callback(ctx: typer.Context) -> None:
                 f"Skipping midterm progress command because dependencies are missing: {_PROGRESS_IMPORT_ERROR}"
             )
         commands.append(("sections dashboard dataset", _sections.process_all))
+        commands.append(("section calendars", _calendars.process_all))
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -170,7 +173,9 @@ def process_engagement_cmd(
     ] = None,
     keep_source_columns: Annotated[
         Optional[bool],
-        typer.Option("--keep-source-cols/--no-source-cols", help="Include per-source columns in output."),
+        typer.Option(
+            "--keep-source-cols/--no-source-cols", help="Include per-source columns in output."
+        ),
     ] = None,
     report: Annotated[
         bool,
@@ -219,6 +224,38 @@ def process_sections_cmd(
 ) -> None:
     """Build canonical sections CSV/JSON from Albert class details."""
     _sections._process_impl(input_path=input_path, output_dir=output_dir)
+
+
+@process_app.command("calendars")
+def process_calendars_cmd(
+    sections_path: Annotated[
+        Optional[Path],
+        typer.Option("--sections-path", help="Path to canonical sections JSON file"),
+    ] = None,
+    calendar_csv: Annotated[
+        Optional[Path],
+        typer.Option("--calendar-csv", help="Path to the raw course calendar CSV file"),
+    ] = None,
+    class_details_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--class-details-path",
+            help="Path to raw Albert class_details JSON file or directory (used for course code in filenames)",
+        ),
+    ] = None,
+    output_dir: Annotated[
+        Optional[Path],
+        typer.Option("--output-dir", help="Output directory for per-section .ics files"),
+    ] = None,
+) -> None:
+    """Build per-section .ics calendar files from sections and the course calendar CSV."""
+    _calendars._process_impl(
+        sections_path=sections_path,
+        calendar_csv_path=calendar_csv,
+        class_details_path=class_details_path,
+        output_dir=output_dir,
+    )
+
 
 # ---------------------------------------------------------------------------
 # report group
@@ -292,6 +329,7 @@ def report_sections_cmd(
     """Generate sections dashboard HTML and summary report."""
     _sections._reports_impl(processed_json_path=processed_json, output_dir=output_dir)
 
+
 # ---------------------------------------------------------------------------
 # daily command
 # ---------------------------------------------------------------------------
@@ -332,6 +370,7 @@ def daily(
         "process.engagement": _engagement.process_all,
         "process.midterm-progress": _process_midterm_progress,
         "process.sections": _sections.process_all,
+        "process.calendars": _calendars.process_all,
         "report.enrollment": _enrollment.report_all,
         "report.engagement": _engagement.report_all,
         "report.sections": _sections.report_all,
@@ -348,6 +387,7 @@ def daily(
         "process.engagement",
         "process.midterm-progress",
         "process.sections",
+        "process.calendars",
         "report.enrollment",
         "report.engagement",
         "report.sections",
@@ -409,9 +449,7 @@ def _compat_brightspace_gradebooks(
 ) -> None:
     """[Deprecated] Use 'get brightspace gradebooks' instead."""
     typer.echo(
-        _DEPRECATION_FMT.format(
-            old="brightspace-gradebooks", new="get brightspace gradebooks"
-        ),
+        _DEPRECATION_FMT.format(old="brightspace-gradebooks", new="get brightspace gradebooks"),
         err=True,
     )
     _brightspace._gradebooks_impl(output_dir=output_dir, clean=clean, headless=headless)
@@ -437,9 +475,7 @@ def _compat_brightspace_attendance(
 ) -> None:
     """[Deprecated] Use 'get brightspace attendance' instead."""
     typer.echo(
-        _DEPRECATION_FMT.format(
-            old="brightspace-attendance", new="get brightspace attendance"
-        ),
+        _DEPRECATION_FMT.format(old="brightspace-attendance", new="get brightspace attendance"),
         err=True,
     )
     _brightspace._attendance_impl(output_dir=output_dir, clean=clean, headless=headless)
@@ -482,9 +518,7 @@ def _compat_albert_class_details(
 ) -> None:
     """[Deprecated] Use 'get albert class-details' instead."""
     typer.echo(
-        _DEPRECATION_FMT.format(
-            old="albert-class-details", new="get albert class-details"
-        ),
+        _DEPRECATION_FMT.format(old="albert-class-details", new="get albert class-details"),
         err=True,
     )
     _albert._class_details_impl(output=output)
@@ -518,9 +552,7 @@ def _compat_gradescope_rosters(
 ) -> None:
     """[Deprecated] Use 'get gradescope rosters' instead."""
     typer.echo(
-        _DEPRECATION_FMT.format(
-            old="gradescope-rosters", new="get gradescope rosters"
-        ),
+        _DEPRECATION_FMT.format(old="gradescope-rosters", new="get gradescope rosters"),
         err=True,
     )
     _gradescope._rosters_impl(output_dir=output_dir, clean=clean)
@@ -556,9 +588,7 @@ def _compat_enrollment_rosters(
 ) -> None:
     """[Deprecated] Use 'process enrollment' instead."""
     typer.echo(
-        _DEPRECATION_FMT.format(
-            old="enrollment-rosters", new="process enrollment"
-        ),
+        _DEPRECATION_FMT.format(old="enrollment-rosters", new="process enrollment"),
         err=True,
     )
     _enrollment._rosters_impl(rosters_dir=rosters_dir, output_dir=output_dir)
@@ -576,9 +606,7 @@ def _compat_enrollment_reports(
 ) -> None:
     """[Deprecated] Use 'report enrollment' instead."""
     typer.echo(
-        _DEPRECATION_FMT.format(
-            old="enrollment-reports", new="report enrollment"
-        ),
+        _DEPRECATION_FMT.format(old="enrollment-reports", new="report enrollment"),
         err=True,
     )
     _enrollment._reports_impl(rosters_dir=rosters_dir, output_dir=output_dir)

@@ -7,6 +7,7 @@ from loguru import logger
 # Load environment variables from .env file if it exists
 load_dotenv()
 
+
 def _find_project_root() -> Path:
     """Locate the project root containing pyproject.toml with [tool.coursedata]."""
 
@@ -49,6 +50,7 @@ DRIVE_CONFIG = _config.get("drive", {})
 ENGAGEMENT_CONFIG = _config.get("engagement", {})
 PROGRESS_REPORT_CONFIG = _config.get("progress_report", {})
 SECTIONS_DASHBOARD_CONFIG = _config.get("sections_dashboard", {})
+CALENDARS_CONFIG = _config.get("calendars", {})
 DAILY_CONFIG = _config.get("daily", {})
 
 # Course Information
@@ -59,6 +61,24 @@ except KeyError as e:
     raise KeyError(
         f"Missing required config key {e} in [tool.coursedata] section of pyproject.toml"
     ) from e
+
+# Registrar term code (e.g. "1268"), matching the naming convention Albert bakes
+# into roster export filenames. Can be set explicitly via [tool.coursedata.albert]
+# term_number; otherwise derived from term_name using the same Term.code scheme
+# python-edubag uses when naming downloaded Albert rosters, so it can't drift out
+# of sync with term_name. Falls back to None if python-edubag (an unpublished,
+# manually-installed sibling package -- see generic/pyproject.toml) isn't
+# installed or term_name isn't in "{Season} {Year}" form.
+_configured_term_code = ALBERT_CONFIG.get("term_number")
+if _configured_term_code is not None:
+    TERM_CODE = str(_configured_term_code)
+else:
+    try:
+        from edubag.albert.term import Term
+
+        TERM_CODE = str(Term.from_name(TERM_NAME).code)
+    except Exception:
+        TERM_CODE = None
 
 
 # Paths
