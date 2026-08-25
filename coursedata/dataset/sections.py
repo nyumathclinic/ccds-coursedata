@@ -122,6 +122,23 @@ def _extract_value(row: dict, keys: list[str]):
     return None
 
 
+# Albert's class-detail scraper reuses one authenticated session across
+# sequential fetches; the roster header component it reads for `section`
+# can lag one fetch behind (still showing the previous course's value).
+# `full_course_name` (e.g. "MATH-UA 120 - 020 Discrete Mathematics") comes
+# from a part of the page that consistently reflects the class actually
+# requested, so prefer parsing the section out of it when available.
+_SECTION_FROM_NAME_RE = re.compile(r"\s-\s*(\d{2,4})\s")
+
+
+def _section_from_full_course_name(row: dict) -> Optional[str]:
+    full_name = row.get("full_course_name")
+    if not isinstance(full_name, str):
+        return None
+    match = _SECTION_FROM_NAME_RE.search(full_name)
+    return match.group(1) if match else None
+
+
 def _normalize_instructors(value) -> str:
     if value is None:
         return ""
@@ -169,7 +186,18 @@ def _normalize_rows(raw_rows: list[dict], snapshot_date: str) -> pd.DataFrame:
     field_map = _coalesce_field_map()
     records = []
     for row in raw_rows:
-        section_value = _extract_value(row, field_map["section"])
+        header_section = _extract_value(row, field_map["section"])
+        derived_section = _section_from_full_course_name(row)
+        if derived_section is not None:
+            section_value = derived_section
+            if header_section is not None and str(header_section).strip() != derived_section:
+                logger.warning(
+                    f"Section field mismatch for class_number={row.get('class_number')}: "
+                    f"raw section field says '{header_section}' but full_course_name says "
+                    f"'{derived_section}' (Albert scraper staleness); using '{derived_section}'."
+                )
+        else:
+            section_value = header_section
         if section_value is None:
             continue
 
