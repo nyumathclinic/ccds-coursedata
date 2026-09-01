@@ -13,6 +13,7 @@ import typer
 try:
     from edubag.albert import xls2csv
     from edubag.albert.client import AlbertClient
+    from edubag.albert.roster import AlbertRoster
     EDUBAG_AVAILABLE = True
 except ImportError:
     EDUBAG_AVAILABLE = False
@@ -21,6 +22,12 @@ from coursedata.config import ALBERT_CONFIG, COURSE_NAME, INTERIM_DATA_DIR, RAW_
 from ._utils import d8, get_password, get_sso_credentials
 
 app = typer.Typer(help="Fetch data from Albert.")
+
+# Albert's classroster page has occasionally rendered stale data for the
+# previously-viewed class instead of the one requested by CLASS_NBR, so every
+# downloaded roster is checked against the expected subject/catalog number
+# before being used downstream (see `_roster_matches_expected_course`).
+MAX_ROSTER_FETCH_ATTEMPTS = 3
 
 
 def _albert_course_ids_and_term() -> tuple[Optional[list], str]:
@@ -38,6 +45,29 @@ def _require_instructor_id() -> str:
         )
         raise typer.Exit(code=1)
     return instructor_id
+
+
+def _roster_matches_expected_course(
+    xls_path: Path, class_number: str, subject: Optional[str], catalog_number: Optional[str]
+) -> bool:
+    """Check that a downloaded roster is for the requested course, not a stale/wrong one."""
+    if not subject or not catalog_number:
+        return True
+    try:
+        roster = AlbertRoster.from_xls(xls_path)
+    except Exception as exc:
+        logger.warning(f"Could not parse roster for class number {class_number} to validate it: {exc}")
+        return True
+    actual_subject = roster.course.get("Subject Code")
+    actual_catalog = roster.course.get("Catalog Number")
+    if actual_subject != subject or str(actual_catalog) != str(catalog_number):
+        logger.error(
+            f"Roster downloaded for class number {class_number} is for the wrong course "
+            f"(expected '{subject} {catalog_number}', got Class Detail "
+            f"'{roster.course.get('Class Detail')}'). Discarding it."
+        )
+        return False
+    return True
 
 
 def _rosters_impl(
@@ -72,21 +102,39 @@ def _rosters_impl(
     course_ids, term = _albert_course_ids_and_term()
     if course_ids:
         instructor_id = _require_instructor_id()
+        subject = ALBERT_CONFIG.get("subject")
+        catalog_number = ALBERT_CONFIG.get("catalog_number")
         logger.info(
             f"Fetching rosters for courses {course_ids} in term '{term}' to '{output_dir}'"
         )
-        xls_path_list = [
-            client.fetch_roster(
-                class_number,
-                term,
-                instructor_id=instructor_id,
-                save_dir=output_dir,
-                username=username,
-                password=password,
-                headless=headless,
-            )
-            for class_number in tqdm(course_ids, desc="Fetching rosters")
-        ]
+        xls_path_list = []
+        for class_number in tqdm(course_ids, desc="Fetching rosters"):
+            xls_path = None
+            for attempt in range(1, MAX_ROSTER_FETCH_ATTEMPTS + 1):
+                candidate = client.fetch_roster(
+                    class_number,
+                    term,
+                    instructor_id=instructor_id,
+                    save_dir=output_dir,
+                    username=username,
+                    password=password,
+                    headless=headless,
+                )
+                if _roster_matches_expected_course(candidate, class_number, subject, catalog_number):
+                    xls_path = candidate
+                    break
+                candidate.unlink(missing_ok=True)
+                logger.warning(
+                    f"Retrying roster fetch for class number {class_number} "
+                    f"(attempt {attempt}/{MAX_ROSTER_FETCH_ATTEMPTS})"
+                )
+            if xls_path is None:
+                logger.error(
+                    f"Giving up on class number {class_number} after "
+                    f"{MAX_ROSTER_FETCH_ATTEMPTS} attempts; no roster saved for it."
+                )
+                continue
+            xls_path_list.append(xls_path)
     else:
         logger.info(
             f"Fetching rosters for course '{COURSE_NAME}' in term '{TERM_NAME}' to '{output_dir}'"
