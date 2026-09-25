@@ -204,7 +204,7 @@ def post_gradescope_grades(
     courses: Annotated[
         Optional[list[str]],
         typer.Option(
-            help="Overrides the course IDs from pyproject.toml; if omitted, uses tool.coursedata.gradescope.courses",
+            help="Overrides configured courses; otherwise uses post_grades_courses, falling back to courses",
         ),
     ] = None,
     username: Annotated[
@@ -218,7 +218,8 @@ def post_gradescope_grades(
 ):
     """Post Gradescope grades to each course's linked LMS (e.g. Brightspace).
 
-    Reads course IDs from [tool.coursedata.gradescope] in pyproject.toml unless overridden.
+    Reads course IDs from post_grades_courses in the Gradescope section of pyproject.toml,
+    falling back to courses when that setting is absent, unless overridden with --courses.
     Auth uses $GRADESCOPE_USERNAME and password from the specified keyring service. For each
     course, every assignment/quiz-container with published grades and an LMS resource link
     gets its grades posted; unpublished or unlinked assignments are skipped with a warning.
@@ -227,10 +228,15 @@ def post_gradescope_grades(
         logger.error("edubag module is not available. Cannot post Gradescope grades.")
         raise typer.Exit(code=1)
 
-    configured_courses = GRADESCOPE_CONFIG.get("courses", [])
-    course_ids = courses or configured_courses
+    configured_courses = GRADESCOPE_CONFIG.get(
+        "post_grades_courses", GRADESCOPE_CONFIG.get("courses", [])
+    )
+    course_ids = courses if courses is not None else configured_courses
     if not course_ids:
-        logger.error("No Gradescope courses configured. Set tool.coursedata.gradescope.courses in pyproject.toml or pass --courses.")
+        logger.error(
+            "No Gradescope courses configured. Set post_grades_courses or courses in "
+            "tool.coursedata.gradescope, or pass --courses."
+        )
         raise typer.Exit(code=1)
 
     # Resolve credentials (do not pass to post_all_grades; let edubag handle)
