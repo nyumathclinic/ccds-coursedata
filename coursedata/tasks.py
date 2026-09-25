@@ -199,6 +199,81 @@ def sync_gradescope_rosters(
         raise typer.Exit(code=1)
 
 
+@app.command("post-gradescope-grades")
+def post_gradescope_grades(
+    courses: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            help="Overrides the course IDs from pyproject.toml; if omitted, uses tool.coursedata.gradescope.courses",
+        ),
+    ] = None,
+    username: Annotated[
+        Optional[str],
+        typer.Option(help="Gradescope username; defaults to $GRADESCOPE_USERNAME from environment"),
+    ] = None,
+    keyring_service: Annotated[
+        str,
+        typer.Option(help="Keyring service name for Gradescope password storage"),
+    ] = "gradescope.com",
+):
+    """Post Gradescope grades to each course's linked LMS (e.g. Brightspace).
+
+    Reads course IDs from [tool.coursedata.gradescope] in pyproject.toml unless overridden.
+    Auth uses $GRADESCOPE_USERNAME and password from the specified keyring service. For each
+    course, every assignment/quiz-container with published grades and an LMS resource link
+    gets its grades posted; unpublished or unlinked assignments are skipped with a warning.
+    """
+    if not EDUBAG_AVAILABLE:
+        logger.error("edubag module is not available. Cannot post Gradescope grades.")
+        raise typer.Exit(code=1)
+
+    configured_courses = GRADESCOPE_CONFIG.get("courses", [])
+    course_ids = courses or configured_courses
+    if not course_ids:
+        logger.error("No Gradescope courses configured. Set tool.coursedata.gradescope.courses in pyproject.toml or pass --courses.")
+        raise typer.Exit(code=1)
+
+    # Resolve credentials (do not pass to post_all_grades; let edubag handle)
+    if not username:
+        username = os.getenv("GRADESCOPE_USERNAME")
+    if not username:
+        logger.warning(
+            "GRADESCOPE_USERNAME not found in environment. Set it in .env or pass --username."
+        )
+    else:
+        os.environ["GRADESCOPE_USERNAME"] = username
+        pw = keyring.get_password(keyring_service, username)
+        if not pw:
+            logger.warning(
+                f"Password for '{username}' not found in Keychain (service '{keyring_service}'). Add it via:"
+            )
+            logger.warning(
+                f"security add-generic-password -s {keyring_service} -a {username} -w YOUR_PASSWORD"
+            )
+
+    # Iterate and post; a course only counts as failed if it raised outright, not for
+    # ordinary per-assignment skips (unpublished / not LMS-linked / no grades yet).
+    success = 0
+    for cid in course_ids:
+        try:
+            logger.info(f"Posting Gradescope grades for course {cid}...")
+            client = GradescopeClient()
+            results = client.post_all_grades(cid)
+            counts: dict[str, int] = {}
+            for result in results:
+                status = result.get("status", "unknown")
+                counts[status] = counts.get(status, 0) + 1
+                if status != "posted":
+                    logger.warning(f"  {result.get('title')}: {status} ({result.get('detail', '')})".rstrip())
+            logger.success(f"Course {cid} summary: {counts or 'no assignments found'}")
+            success += 1
+        except Exception as e:
+            logger.error(f"Failed to post grades for course {cid}: {e}")
+
+    if success == 0:
+        raise typer.Exit(code=1)
+
+
 @app.command("sync-gradescope-sections")
 def sync_gradescope_sections(
     gradescope_courses: Annotated[
@@ -470,6 +545,7 @@ def daily():
     step_handlers = {
         "sync-gradescope-rosters": sync_gradescope_rosters,
         "sync-gradescope-sections": sync_gradescope_sections,
+        "post-gradescope-grades": post_gradescope_grades,
     }
     default_steps = ["sync-gradescope-rosters"]
 
