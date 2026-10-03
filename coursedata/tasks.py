@@ -31,11 +31,18 @@ try:
 except ImportError:
     BRIGHTSPACE_AVAILABLE = False
 
+try:
+    from edubag.polleverywhere.client import Client as PollEverywhereClient
+    POLLEVERYWHERE_AVAILABLE = True
+except ImportError:
+    POLLEVERYWHERE_AVAILABLE = False
+
 from coursedata.config import (
     COURSE_NAME,
     TERM_NAME,
     DAILY_CONFIG,
     GRADESCOPE_CONFIG,
+    POLLEVERYWHERE_CONFIG,
     RAW_DATA_DIR,
     PROCESSED_DATA_DIR,
 )
@@ -275,6 +282,49 @@ def post_gradescope_grades(
             success += 1
         except Exception as e:
             logger.error(f"Failed to post grades for course {cid}: {e}")
+
+    if success == 0:
+        raise typer.Exit(code=1)
+
+
+@app.command("sync-polleverywhere-assignments")
+def sync_polleverywhere_assignments(
+    courses: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            help="Overrides the class IDs from pyproject.toml; if omitted, uses tool.coursedata.polleverywhere.courses",
+        ),
+    ] = None,
+):
+    """Sync all eligible Poll Everywhere assignments to the LMS for configured courses.
+
+    Reads class IDs from [tool.coursedata.polleverywhere] in pyproject.toml unless overridden.
+    Requires prior authentication via `edubag polleverywhere authenticate`.
+    """
+    if not POLLEVERYWHERE_AVAILABLE:
+        logger.error("edubag Poll Everywhere module is not available.")
+        raise typer.Exit(code=1)
+
+    course_ids = courses or POLLEVERYWHERE_CONFIG.get("courses", [])
+    if not course_ids:
+        logger.error(
+            "No Poll Everywhere courses configured. Set tool.coursedata.polleverywhere.courses in pyproject.toml or pass --courses."
+        )
+        raise typer.Exit(code=1)
+
+    success = 0
+    for cid in course_ids:
+        try:
+            logger.info(f"Syncing Poll Everywhere assignments for class {cid}...")
+            client = PollEverywhereClient()
+            cls = client.fetch_class(int(cid), headless=True)
+            synced = client.sync_all_assignments_to_lms(cls, headless=True)
+            logger.success(f"Synced {len(synced)} assignment(s) for class {cls.id} ({cls.name}).")
+            for assignment in synced:
+                logger.info(f"  - {assignment.id}: {assignment.name}")
+            success += 1
+        except Exception as e:
+            logger.error(f"Failed to sync Poll Everywhere assignments for class {cid}: {e}")
 
     if success == 0:
         raise typer.Exit(code=1)
@@ -552,6 +602,7 @@ def daily():
         "sync-gradescope-rosters": sync_gradescope_rosters,
         "sync-gradescope-sections": sync_gradescope_sections,
         "post-gradescope-grades": post_gradescope_grades,
+        "sync-polleverywhere-assignments": sync_polleverywhere_assignments,
     }
     default_steps = ["sync-gradescope-rosters"]
 
