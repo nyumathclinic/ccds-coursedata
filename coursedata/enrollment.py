@@ -3,6 +3,7 @@
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
+import re
 
 from loguru import logger
 import pandas as pd
@@ -25,7 +26,8 @@ def find_roster_files(rosters_dir: Path) -> dict[str, list[tuple[str, Path]]]:
 
     # Find all CSV files in dated subdirectories
     for date_dir in sorted(rosters_dir.iterdir()):
-        if not date_dir.is_dir():
+        # Only dated snapshot folders; skip e.g. a "latest" folder.
+        if not date_dir.is_dir() or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_dir.name):
             continue
 
         date_str = date_dir.name

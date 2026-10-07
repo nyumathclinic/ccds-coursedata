@@ -20,6 +20,7 @@ except ImportError:
 
 from coursedata.config import ALBERT_CONFIG, COURSE_NAME, INTERIM_DATA_DIR, RAW_DATA_DIR, TERM_NAME
 from ._utils import d8, get_password, get_sso_credentials
+from .photo_rosters import PHOTO_ROSTERS_RAW_DIR
 
 app = typer.Typer(help="Fetch data from Albert.")
 
@@ -111,6 +112,8 @@ def _rosters_impl(
         for class_number in tqdm(course_ids, desc="Fetching rosters"):
             xls_path = None
             for attempt in range(1, MAX_ROSTER_FETCH_ATTEMPTS + 1):
+                # fetch_roster returns a list of saved paths; the default
+                # Excel format yields exactly one.
                 candidate = client.fetch_roster(
                     class_number,
                     term,
@@ -119,7 +122,7 @@ def _rosters_impl(
                     username=username,
                     password=password,
                     headless=headless,
-                )
+                )[0]
                 if _roster_matches_expected_course(candidate, class_number, subject, catalog_number):
                     xls_path = candidate
                     break
@@ -206,6 +209,58 @@ def _class_details_impl(
     logger.success("Class details fetched successfully.")
 
 
+def _photo_rosters_impl(headless: bool = False) -> None:
+    """Fetch HTML rosters with student photos for the configured class numbers.
+
+    Only the latest copy of each is kept, in
+    ``RAW_DATA_DIR/albert/rosters/latest/<class number>/``.
+    """
+    if not EDUBAG_AVAILABLE:
+        logger.error("edubag module is not available. Cannot fetch photo rosters.")
+        raise typer.Exit(code=1)
+
+    class_numbers = [str(n) for n in ALBERT_CONFIG.get("photo_rosters", [])]
+    if not class_numbers:
+        logger.info("No [tool.coursedata.albert].photo_rosters configured; skipping.")
+        return
+
+    username, password = get_sso_credentials()
+    client = AlbertClient()
+    instructor_id = _require_instructor_id()
+    _, term = _albert_course_ids_and_term()
+
+    for class_number in tqdm(class_numbers, desc="Fetching photo rosters"):
+        output_dir = PHOTO_ROSTERS_RAW_DIR / class_number
+        for attempt in range(1, MAX_ROSTER_FETCH_ATTEMPTS + 1):
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            [html_path] = client.fetch_roster(
+                class_number,
+                term,
+                instructor_id=instructor_id,
+                save_dir=output_dir,
+                username=username,
+                password=password,
+                headless=headless,
+                fmt="html",
+            )
+            actual = str(AlbertRoster.from_html(html_path).course.get("Class Number", ""))
+            if actual == class_number:
+                logger.info(f"Saved photo roster for class number {class_number} to {html_path}")
+                break
+            logger.warning(
+                f"Photo roster fetched for class number {class_number} is for class number "
+                f"'{actual}' (attempt {attempt}/{MAX_ROSTER_FETCH_ATTEMPTS}); discarding it."
+            )
+        else:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            logger.error(
+                f"Giving up on photo roster for class number {class_number} after "
+                f"{MAX_ROSTER_FETCH_ATTEMPTS} attempts."
+            )
+    logger.success("Photo rosters fetched.")
+
+
 def run_all(headless: bool = False) -> None:
     """Run all Albert fetch commands."""
     _rosters_impl(headless=headless)
@@ -258,3 +313,10 @@ def class_details(
     """Fetch all class details for the specified course and term, and save to output."""
     headless = (ctx.obj or {}).get("headless", False)
     _class_details_impl(output=output, headless=headless)
+
+
+@app.command("photo-rosters")
+def photo_rosters(ctx: typer.Context) -> None:
+    """Fetch HTML rosters with student photos for the configured photo_rosters class numbers."""
+    headless = (ctx.obj or {}).get("headless", False)
+    _photo_rosters_impl(headless=headless)

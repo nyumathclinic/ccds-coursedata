@@ -25,6 +25,7 @@ from . import engagement as _engagement
 from . import enrollment as _enrollment
 from . import gmail as _gmail
 from . import gradescope as _gradescope
+from . import photo_rosters as _photo_rosters
 from . import sections as _sections
 
 try:
@@ -226,6 +227,12 @@ def process_sections_cmd(
     _sections._process_impl(input_path=input_path, output_dir=output_dir)
 
 
+@process_app.command("photo-rosters")
+def process_photo_rosters_cmd() -> None:
+    """Convert the latest Albert photo rosters to JSON and Anki decks."""
+    _photo_rosters.process_all()
+
+
 @process_app.command("calendars")
 def process_calendars_cmd(
     sections_path: Annotated[
@@ -361,6 +368,7 @@ def daily(
 
     step_handlers = {
         "get.albert": lambda: _albert.run_all(headless=headless),
+        "get.albert-photo-rosters": lambda: _albert._photo_rosters_impl(headless=headless),
         "get.brightspace": lambda: _brightspace.run_all(headless=headless),
         "get.drive": lambda: _drive.run_all(headless=headless),
         "get.gradescope": lambda: _gradescope.run_all(headless=headless),
@@ -369,6 +377,7 @@ def daily(
         "process.gmail-filters": _gmail.process_all,
         "process.engagement": _engagement.process_all,
         "process.midterm-progress": _process_midterm_progress,
+        "process.photo-rosters": _photo_rosters.process_all,
         "process.sections": _sections.process_all,
         "process.calendars": _calendars.process_all,
         "report.enrollment": _enrollment.report_all,

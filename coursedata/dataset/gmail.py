@@ -1,6 +1,7 @@
 """Gmail CLI commands for ``dataset process gmail-filters``."""
 
 from pathlib import Path
+import re
 from typing import Optional
 
 from loguru import logger
@@ -28,7 +29,11 @@ def _filters_impl(
         logger.info("No roster files provided. Using most recently downloaded rosters.")
         rosters_base_dir = RAW_DATA_DIR / "albert" / "rosters"
 
-        date_dirs = sorted([d for d in rosters_base_dir.iterdir() if d.is_dir()])
+        # Only dated snapshot folders; skip e.g. rosters/latest (photo rosters).
+        date_dirs = sorted(
+            d for d in rosters_base_dir.iterdir()
+            if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name)
+        )
         if not date_dirs:
             logger.error(f"No roster directories found in {rosters_base_dir}")
             raise typer.Exit(code=1)
