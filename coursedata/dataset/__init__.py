@@ -236,6 +236,17 @@ def process_photo_rosters_cmd() -> None:
     _photo_rosters.process_all()
 
 
+@process_app.command("webassign")
+def process_webassign_cmd(
+    date: Annotated[
+        Optional[str],
+        typer.Option(help="Download date to process, YYYY-MM-DD (default: the newest)"),
+    ] = None,
+) -> None:
+    """Convert WebAssign roster and scores downloads to plain CSV and JSON."""
+    _webassign._process_impl(date=date)
+
+
 @process_app.command("calendars")
 def process_calendars_cmd(
     sections_path: Annotated[
@@ -382,6 +393,7 @@ def daily(
         "process.engagement": _engagement.process_all,
         "process.midterm-progress": _process_midterm_progress,
         "process.photo-rosters": _photo_rosters.process_all,
+        "process.webassign": _webassign.process_all,
         "process.sections": _sections.process_all,
         "process.calendars": _calendars.process_all,
         "report.enrollment": _enrollment.report_all,
