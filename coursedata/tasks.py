@@ -37,12 +37,19 @@ try:
 except ImportError:
     POLLEVERYWHERE_AVAILABLE = False
 
+try:
+    from edubag.webassign.client import WebAssignClient
+    WEBASSIGN_AVAILABLE = True
+except ImportError:
+    WEBASSIGN_AVAILABLE = False
+
 from coursedata.config import (
     COURSE_NAME,
     TERM_NAME,
     DAILY_CONFIG,
     GRADESCOPE_CONFIG,
     POLLEVERYWHERE_CONFIG,
+    WEBASSIGN_CONFIG,
     RAW_DATA_DIR,
     PROCESSED_DATA_DIR,
 )
@@ -330,6 +337,56 @@ def sync_polleverywhere_assignments(
         raise typer.Exit(code=1)
 
 
+@app.command("sync-webassign-scores")
+def sync_webassign_scores(
+    courses: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            help="Overrides the section IDs from pyproject.toml; if omitted, uses tool.coursedata.webassign.courses",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Find 'Send Scores To LMS' but do not click it")
+    ] = False,
+):
+    """Send each configured WebAssign section's scores to the linked LMS.
+
+    WebAssign allows one sync per section per hour, and a sync can overwrite
+    score edits made in the LMS gradebook. Reads section IDs from
+    [tool.coursedata.webassign] in pyproject.toml unless overridden.
+    """
+    if not WEBASSIGN_AVAILABLE:
+        logger.error("edubag WebAssign module is not available.")
+        raise typer.Exit(code=1)
+
+    section_ids = courses or [str(s) for s in WEBASSIGN_CONFIG.get("courses", [])]
+    if not section_ids:
+        logger.error(
+            "No WebAssign sections configured. Set tool.coursedata.webassign.courses in pyproject.toml or pass --courses."
+        )
+        raise typer.Exit(code=1)
+
+    success = 0
+    client = WebAssignClient()
+    for section in section_ids:
+        try:
+            result = client.sync_scores(section, dry_run=dry_run, headless=True)
+        except Exception as e:
+            logger.error(f"Failed to sync WebAssign scores for section {section}: {e}")
+            continue
+        if result["dry_run"]:
+            logger.info(f"Dry run: {result['message']} for section {section}; nothing sent.")
+            success += 1
+        elif result["sent"]:
+            logger.success(f"{result['message']} (section {section}).")
+            success += 1
+        else:
+            logger.error(f"{result['message']} (section {section}, HTTP {result.get('status')}).")
+
+    if success == 0:
+        raise typer.Exit(code=1)
+
+
 @app.command("sync-gradescope-sections")
 def sync_gradescope_sections(
     gradescope_courses: Annotated[
@@ -603,6 +660,7 @@ def daily():
         "sync-gradescope-sections": sync_gradescope_sections,
         "post-gradescope-grades": post_gradescope_grades,
         "sync-polleverywhere-assignments": sync_polleverywhere_assignments,
+        "sync-webassign-scores": sync_webassign_scores,
     }
     default_steps = ["sync-gradescope-rosters"]
 

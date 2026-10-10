@@ -27,6 +27,7 @@ from . import gmail as _gmail
 from . import gradescope as _gradescope
 from . import photo_rosters as _photo_rosters
 from . import sections as _sections
+from . import webassign as _webassign
 
 try:
     from . import progress as _progress
@@ -72,6 +73,7 @@ def get_callback(
             ("drive", _drive.run_all),
             ("gradescope", _gradescope.run_all),
             ("edstem", _edstem.run_all),
+            ("webassign", _webassign.run_all),
         ]
         with Progress(
             SpinnerColumn(),
@@ -89,6 +91,7 @@ get_app.add_typer(_brightspace.app, name="brightspace")
 get_app.add_typer(_drive.app, name="drive")
 get_app.add_typer(_gradescope.app, name="gradescope")
 get_app.add_typer(_edstem.app, name="edstem")
+get_app.add_typer(_webassign.app, name="webassign")
 
 app.add_typer(get_app, name="get")
 
@@ -373,6 +376,7 @@ def daily(
         "get.drive": lambda: _drive.run_all(headless=headless),
         "get.gradescope": lambda: _gradescope.run_all(headless=headless),
         "get.edstem": lambda: _edstem.run_all(headless=headless),
+        "get.webassign": lambda: _webassign.run_all(headless=headless),
         "process.enrollment": _enrollment.process_all,
         "process.gmail-filters": _gmail.process_all,
         "process.engagement": _engagement.process_all,
