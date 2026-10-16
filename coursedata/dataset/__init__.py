@@ -302,6 +302,23 @@ def process_calendars_cmd(
     )
 
 
+@process_app.command("gradescope-grading")
+def process_gradescope_grading_cmd(
+    exam: Annotated[
+        Optional[str],
+        typer.Argument(help="Exam key in [tool.coursedata.gradescope.grading] (optional if only one)"),
+    ] = None,
+    snapshot: Annotated[
+        Optional[Path],
+        typer.Option(help="Snapshot directory to process (default: the newest)"),
+    ] = None,
+) -> None:
+    """Build grading progress, score statistics, and missing-part lists for a Gradescope exam."""
+    from .gradescope import grading as _grading
+
+    _grading._process_impl(exam, snapshot_dir=snapshot)
+
+
 # ---------------------------------------------------------------------------
 # report group
 # ---------------------------------------------------------------------------
@@ -373,6 +390,71 @@ def report_sections_cmd(
 ) -> None:
     """Generate sections dashboard HTML and summary report."""
     _sections._reports_impl(processed_json_path=processed_json, output_dir=output_dir)
+
+
+@report_app.command("gradescope-grading")
+def report_gradescope_grading_cmd(
+    exam: Annotated[
+        Optional[str],
+        typer.Argument(help="Exam key in [tool.coursedata.gradescope.grading] (optional if only one)"),
+    ] = None,
+    refresh: Annotated[
+        int, typer.Option(help="Seconds between automatic page reloads")
+    ] = 60,
+) -> None:
+    """Render the grading dashboard HTML (kept under data/, since it lists students)."""
+    from .gradescope import grading as _grading
+
+    path = _grading._report_impl(exam, refresh_seconds=refresh)
+    typer.echo(path.resolve().as_uri())
+
+
+# ---------------------------------------------------------------------------
+# watch group
+# ---------------------------------------------------------------------------
+
+watch_app = typer.Typer(
+    help="Fetch, process and report in a loop, for live dashboards.",
+    no_args_is_help=True,
+)
+
+
+@watch_app.command("gradescope-grading")
+def watch_gradescope_grading_cmd(
+    exam: Annotated[
+        Optional[str],
+        typer.Argument(help="Exam key in [tool.coursedata.gradescope.grading] (optional if only one)"),
+    ] = None,
+    every: Annotated[
+        str, typer.Option(help="Time between refreshes, e.g. 90s, 3m, 1h")
+    ] = "3m",
+    keep: Annotated[
+        int, typer.Option(help="Raw snapshots to keep (0 keeps all); history.csv keeps progress")
+    ] = 20,
+    open_browser: Annotated[
+        bool, typer.Option("--open/--no-open", help="Open the dashboard in a browser")
+    ] = True,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless/--headed",
+            help="Run browser headless (for automation) or headed (for debugging).",
+        ),
+    ] = True,
+) -> None:
+    """Refresh a Gradescope exam's grading dashboard until interrupted (Ctrl-C)."""
+    from .gradescope import grading as _grading
+
+    _grading._watch_impl(
+        exam,
+        every=_grading.parse_duration(every),
+        headless=headless,
+        keep=keep,
+        open_browser=open_browser,
+    )
+
+
+app.add_typer(watch_app, name="watch")
 
 
 # ---------------------------------------------------------------------------

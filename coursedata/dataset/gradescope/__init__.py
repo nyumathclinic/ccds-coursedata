@@ -15,7 +15,7 @@ except ImportError:
     EDUBAG_AVAILABLE = False
 
 from coursedata.config import COURSE_NAME, GRADESCOPE_CONFIG, RAW_DATA_DIR, TERM_NAME
-from ._utils import d8, get_password
+from .._utils import d8, get_password
 
 app = typer.Typer(help="Fetch data from Gradescope.")
 
@@ -152,3 +152,21 @@ def rosters(
     """Fetch Gradescope rosters for configured courses and save to output_dir."""
     headless = (ctx.obj or {}).get("headless", False)
     _rosters_impl(output_dir=output_dir, clean=clean, headless=headless)
+
+
+@app.command("grading")
+def grading_cmd(
+    ctx: typer.Context,
+    exam: Annotated[
+        Optional[str],
+        typer.Argument(help="Exam key in [tool.coursedata.gradescope.grading] (optional if only one)"),
+    ] = None,
+    scores: Annotated[
+        bool, typer.Option("--scores/--no-scores", help="Also download each version's scores CSV")
+    ] = True,
+) -> None:
+    """Snapshot an exam's grading progress and scores from Gradescope (all parts and versions)."""
+    from .grading import _get_impl
+
+    headless = (ctx.obj or {}).get("headless", False)
+    _get_impl(exam, headless=headless, scores=scores)
