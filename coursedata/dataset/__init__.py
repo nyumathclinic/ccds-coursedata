@@ -245,9 +245,19 @@ def process_artifacts_cmd(
             help="Exam directories of scanned PDFs (default: every subdirectory of RAW_DATA_DIR/artifacts)"
         ),
     ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="List new files, exams, and missing templates; write nothing."),
+    ] = False,
+    forget: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Delete this batch folder and its ledger rows, so its files are processed again."
+        ),
+    ] = None,
 ) -> None:
-    """Reorganize scanned exam stacks into per-version PDFs and bubblesheets for Gradescope."""
-    _artifacts.process_all(exam_dirs)
+    """Reorganize new scanned exams into a batch of per-version PDFs and bubblesheets for Gradescope."""
+    _artifacts.process_all(exam_dirs, dry_run=dry_run, forget=forget)
 
 
 @process_app.command("webassign")

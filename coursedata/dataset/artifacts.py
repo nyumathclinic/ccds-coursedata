@@ -1,30 +1,44 @@
 """Scanned exam stacks -> per-version PDFs for uploading to Gradescope.
 
 Commands are wired into:
-    python -m coursedata.dataset process artifacts [EXAM_DIR ...]
+    python -m coursedata.dataset process artifacts [EXAM_DIR ...] [--dry-run] [--forget BATCH]
 
-Each exam directory (e.g. ``RAW_DATA_DIR/artifacts/ch6``) holds scanner PDFs, each a stack of
-concatenated exams, plus ``templates/<version code>.pdf`` -- one blank exam per version. Every
-scanned page carries a Code39 serial number (the last character is a mod-43 check character);
-the cover additionally carries an Aztec code whose text is the version code (e.g.
-``ch6-16A.qns``), and the Gradescope bubblesheet carries ArUco markers 0-3 in its corners.
+Each exam directory (e.g. ``RAW_DATA_DIR/artifacts/ch6``) holds scanner PDFs plus
+``templates/<version code>.pdf`` -- one blank exam per version. The cover of each exam carries an
+Aztec code whose text is the version code (e.g. ``ch6-16A.qns``), and the Gradescope bubblesheet
+carries ArUco markers 0-3 in its corners. Scanner PDFs come in two kinds:
 
-Output goes to the same relative path under ``PROCESSED_DATA_DIR``:
+* barcoded stacks of concatenated exams, where every page carries a Code39 serial number (the
+  last character is a mod-43 check character) identifying its exam;
+* unbarcoded PDFs (e.g. from the testing center), each holding exactly one exam.
 
-* ``<version>.pdf``: every exam of that version, sorted by serial number, with each exam's pages
-  put in template order. A missing page is replaced by the blank template page; a scanned page
-  that matches no template page is appended after the exam's template pages.
+Runs are incremental. Each run processes only raw PDFs not seen before (by content hash) and
+writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<exam>/<timestamp>/``:
+
+* ``<version>.pdf``: the batch's exams of that version, sorted by serial number, with each exam's
+  pages put in template order. A missing page is replaced by the blank template page; a scanned
+  page that matches no template page is appended after the exam's template pages, unless it is
+  totally blank, in which case it is dropped.
 * ``<version>-bubblesheets.pdf``: only the bubblesheet pages, in the same order. A blank Name or
   ID box is filled with an image of what the student wrote in the matching box on the cover.
+* ``held/<exam>.pdf``: exams that look like ones emitted in an earlier batch (same serial, or an
+  unbarcoded exam of an already-emitted unbarcoded version). Not for upload; resolve by hand.
 * ``report.csv``: one row per exam, recording the page mapping, fills, and any warnings.
 
-Here ``<version>`` is the Aztec text without its extension (``ch6-16A``).
+Here ``<version>`` is the Aztec text without its extension (``ch6-16A``). The ledgers
+``processed_files.csv`` and ``processed_exams.csv`` next to the batch folders record what has been
+processed; ``--forget BATCH`` deletes a batch and its ledger rows so it can be redone.
 """
 
 from collections import defaultdict
 import csv
 from dataclasses import dataclass, field
+from datetime import datetime
+from fnmatch import fnmatch
+import hashlib
 from pathlib import Path
+import re
+import shutil
 
 import cv2
 from loguru import logger
@@ -42,11 +56,34 @@ ARTIFACTS_PROCESSED_DIR = PROCESSED_DATA_DIR / "artifacts"
 # Labels of the boxes students write in, found by exact word match on the template pages.
 COVER_LABELS = ARTIFACTS_CONFIG.get("cover_labels", {"name": "Name:", "id": "NetID:"})
 BUBBLESHEET_LABELS = ARTIFACTS_CONFIG.get("bubblesheet_labels", {"name": "Name", "id": "ID"})
+# Optional regex an exam serial (Code39 without its check character) must fully match, to keep
+# other Code39 barcodes (e.g. on testing-center forms) from being taken for exam serials.
+SERIAL_PATTERN = ARTIFACTS_CONFIG.get("serial_pattern")
+
+# Personalized exams (Aztec "<exam>-<netid>.qns") are grouped under the student's base version
+# from this CSV (columns exam, netid, name, version; exam and version are space-separated
+# lists: exam globs, and candidate version labels of which the first existing one is used).
+PERSONALIZED_CSV = Path(
+    ARTIFACTS_CONFIG.get("personalized_csv", RAW_DATA_DIR / "artifacts" / "personalized-exams.csv")
+)
+
+FILES_LEDGER = "processed_files.csv"
+EXAMS_LEDGER = "processed_exams.csv"
 
 DPI = 200  # render resolution for barcode reading and registration
 RETRY_DPI = 300  # second try at the Code39 strip when the first render doesn't decode
-THUMB_SCALE = 1 / 8  # matching thumbnails are DPI * THUMB_SCALE = 25 dpi
-INK_SCALE = 1 / 4  # ink masks for matching are DPI * INK_SCALE = 50 dpi
+LETTER = (8.5, 11.0)  # inches; pages are cropped/padded to this before matching
+ALIGN_DPI = 100  # resolution at which scanned pages are aligned to templates
+THUMB_DPI = 25  # resolution of matching thumbnails
+INK_DPI = 50  # resolution of ink masks for matching
+EDGE_MARGIN = 0.02  # fraction of each page edge ignored in matching (scanner border lines)
+# A scanned page is aligned to its template by ORB features matched against the header/footer
+# that most template pages share. Some scanners shrink the page (~4% seen); pages without the
+# header (cover, bubblesheet, reference sheets, extra paper) fall back to the median alignment of
+# the other pages from the same file.
+MAX_ALIGN_SCALE_ERROR = 0.1
+MAX_ALIGN_ROTATION = 3.0  # degrees
+MIN_ALIGN_INLIERS = 8
 BARCODE_STRIP = 0.08  # top fraction of the page masked out of matching (serial differs)
 # Template pages whose thumbnails correlate above this (blank scratch pages, mostly-empty
 # free-response pages) are told apart only by the regions where they differ.
@@ -67,6 +104,8 @@ FEATURE_PENALTY = 5.0
 MATCH_COST_THRESHOLD = float(ARTIFACTS_CONFIG.get("match_cost_threshold", 3.0))
 # Fraction of a box's pixels that must be new ink for the box to count as filled in.
 INK_THRESHOLD = float(ARTIFACTS_CONFIG.get("ink_threshold", 0.002))
+# An unmatched page with less than this fraction of marked pixels is totally blank and dropped.
+BLANK_PAGE_THRESHOLD = float(ARTIFACTS_CONFIG.get("blank_page_threshold", 0.0005))
 
 ARUCO_DICT = cv2.aruco.DICT_5X5_50
 BUBBLESHEET_MARKER_IDS = {0, 1, 2, 3}
@@ -93,6 +132,18 @@ def split_code39(text: str) -> tuple[str, bool]:
         return serial, False
 
 
+def is_exam_serial(text: str) -> str | None:
+    """The exam serial encoded by a decoded Code39 string, or None if it isn't one.
+
+    An exam serial's check character must validate, and the serial must match SERIAL_PATTERN
+    if one is configured.
+    """
+    serial, ok = split_code39(text)
+    if not ok or (SERIAL_PATTERN and not re.fullmatch(SERIAL_PATTERN, serial)):
+        return None
+    return serial
+
+
 def version_label(aztec_text: str) -> str:
     """Version label for output filenames: the Aztec text without its extension."""
     return Path(aztec_text).stem
@@ -108,28 +159,98 @@ def to_gray(page: pymupdf.Page, dpi: int = DPI) -> np.ndarray:
     return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width).copy()
 
 
-def thumbnail(img: np.ndarray) -> np.ndarray:
-    """Blurred, standardized low-res thumbnail with the barcode strip masked out."""
-    small = cv2.resize(img, None, fx=THUMB_SCALE, fy=THUMB_SCALE, interpolation=cv2.INTER_AREA)
-    small = cv2.GaussianBlur(small.astype(np.float32), (5, 5), 0)
-    small[: int(small.shape[0] * BARCODE_STRIP)] = 255
-    small -= small.mean()
-    norm = np.linalg.norm(small)
-    return small / norm if norm else small
+def fit_letter(img: np.ndarray, dpi: int = DPI) -> np.ndarray:
+    """Crop or pad (with white) a page image at ``dpi`` to letter size, anchored top left.
+
+    Scanners differ in the page size they report, but not in physical scale, so cropping keeps
+    scans and templates at the same scale for matching.
+    """
+    w, h = round(LETTER[0] * dpi), round(LETTER[1] * dpi)
+    out = np.full((h, w), 255, np.uint8)
+    crop = img[:h, :w]
+    out[: crop.shape[0], : crop.shape[1]] = crop
+    return out
 
 
-def ink_mask(img: np.ndarray) -> np.ndarray:
-    """Low-res mask of dark pixels, for matching."""
-    small = cv2.resize(img, None, fx=INK_SCALE, fy=INK_SCALE, interpolation=cv2.INTER_AREA)
-    return small < 160
+def letter_size(dpi: int) -> tuple[int, int]:
+    """(width, height) in pixels of a letter page at ``dpi``."""
+    return round(LETTER[0] * dpi), round(LETTER[1] * dpi)
+
+
+def align_image(img: np.ndarray) -> np.ndarray:
+    """A DPI page image cropped/padded to letter size and reduced to ALIGN_DPI."""
+    return cv2.resize(fit_letter(img), letter_size(ALIGN_DPI), interpolation=cv2.INTER_AREA)
+
+
+def features(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(thumbnail, ink mask) for matching, from an ALIGN_DPI letter-size image.
+
+    The thumbnail is blurred and standardized with the barcode strip masked out; the ink mask
+    is the dark pixels at INK_DPI. Page edges are whitened in both.
+    """
+    small = cv2.resize(img, letter_size(INK_DPI), interpolation=cv2.INTER_AREA)
+    h, w = small.shape
+    m = int(EDGE_MARGIN * min(h, w))
+    small[:m], small[h - m :], small[:, :m], small[:, w - m :] = 255, 255, 255, 255
+    thumb = cv2.resize(small, letter_size(THUMB_DPI), interpolation=cv2.INTER_AREA)
+    thumb = cv2.GaussianBlur(thumb.astype(np.float32), (5, 5), 0)
+    thumb[: int(thumb.shape[0] * BARCODE_STRIP)] = 255
+    thumb -= thumb.mean()
+    norm = np.linalg.norm(thumb)
+    return (thumb / norm if norm else thumb), small < 160
+
+
+_ORB = cv2.ORB_create(nfeatures=3000)
+_MATCHER = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+
+def estimate_alignment(img: np.ndarray, ref_kp, ref_des) -> np.ndarray | None:
+    """Similarity transform (2x3) taking ``img`` onto the reference features, or None."""
+    kp, des = _ORB.detectAndCompute(img, None)
+    if des is None or ref_des is None or len(kp) < 2:
+        return None
+    good = [
+        pair[0]
+        for pair in _MATCHER.knnMatch(des, ref_des, k=2)
+        if len(pair) == 2 and pair[0].distance < 0.8 * pair[1].distance
+    ]
+    if len(good) < MIN_ALIGN_INLIERS:
+        return None
+    src = np.float32([kp[m.queryIdx].pt for m in good])
+    dst = np.float32([ref_kp[m.trainIdx].pt for m in good])
+    transform, inliers = cv2.estimateAffinePartial2D(
+        src, dst, method=cv2.RANSAC, ransacReprojThreshold=3
+    )
+    if transform is None or inliers.sum() < MIN_ALIGN_INLIERS:
+        return None
+    scale = np.hypot(transform[0, 0], transform[1, 0])
+    angle = np.degrees(np.arctan2(transform[1, 0], transform[0, 0]))
+    if abs(scale - 1) > MAX_ALIGN_SCALE_ERROR or abs(angle) > MAX_ALIGN_ROTATION:
+        return None
+    return transform
+
+
+def warp_to(img: np.ndarray, transform: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Warp ``img`` by a 2x3 transform into an image of ``shape``, padding with white."""
+    return cv2.warpAffine(
+        img, transform, (shape[1], shape[0]), flags=cv2.INTER_LINEAR, borderValue=255
+    )
+
+
+def marked_fraction(img: np.ndarray) -> float:
+    """Fraction of a page marked relative to its local background (works on colored paper)."""
+    h, w = img.shape
+    m = int(0.05 * min(h, w))  # ignore scanner edges
+    inner = img[m : h - m, m : w - m]
+    marks = cv2.adaptiveThreshold(
+        inner, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 25
+    )
+    marks = cv2.morphologyEx(marks, cv2.MORPH_OPEN, np.ones((3, 3)))
+    return float(np.count_nonzero(marks)) / marks.size
 
 
 def ink_recall_cost(scan_ink: np.ndarray, tpl_ink: np.ndarray, distinct: np.ndarray) -> float:
     """1 - fraction of ``distinct`` template ink found in the scan, after aligning the two."""
-    if scan_ink.shape != tpl_ink.shape:
-        scan_ink = cv2.resize(
-            scan_ink.astype(np.uint8), tpl_ink.shape[::-1], interpolation=cv2.INTER_NEAREST
-        ).astype(bool)
     (dx, dy), _ = cv2.phaseCorrelate(tpl_ink.astype(np.float32), scan_ink.astype(np.float32))
     shift = np.float32([[1, 0, -dx], [0, 1, -dy]])
     tolerant = cv2.dilate(scan_ink.astype(np.uint8), np.ones((3, 3)))
@@ -223,18 +344,16 @@ class ScannedPage:
     serial: str | None
     aztec: str | None
     bubblesheet: bool
-    thumb: np.ndarray
-    ink: np.ndarray  # packed bits of ink_mask()
-    ink_shape: tuple[int, int]
+    image: bytes  # PNG of align_image()
+    blank: bool
     warnings: list[str] = field(default_factory=list)
 
     @property
     def ref(self) -> str:
         return f"{self.source.name}:{self.index + 1}"
 
-    def ink_mask(self) -> np.ndarray:
-        n = self.ink_shape[0] * self.ink_shape[1]
-        return np.unpackbits(self.ink)[:n].reshape(self.ink_shape).astype(bool)
+    def align_image(self) -> np.ndarray:
+        return cv2.imdecode(np.frombuffer(self.image, np.uint8), cv2.IMREAD_GRAYSCALE)
 
 
 def read_code39(page: pymupdf.Page, results) -> tuple[str | None, list[str]]:
@@ -248,10 +367,11 @@ def read_code39(page: pymupdf.Page, results) -> tuple[str | None, list[str]]:
     warnings = []
     serials = set()
     for text in texts:
-        serial, ok = split_code39(text)
-        if not ok:
-            warnings.append(f"Code39 {text!r} fails its check character")
-        serials.add(serial)
+        serial = is_exam_serial(text)
+        if serial is None:
+            logger.debug(f"page {page.number + 1}: ignoring Code39 {text!r} (not an exam serial)")
+        else:
+            serials.add(serial)
     if len(serials) > 1:
         warnings.append(f"several Code39 serials on one page: {sorted(serials)}")
         return None, warnings
@@ -267,7 +387,6 @@ def scan_stack(pdf_path: Path) -> list[ScannedPage]:
             results = zxingcpp.read_barcodes(img)
             serial, warnings = read_code39(page, results)
             aztecs = [r.text for r in results if r.format == zxingcpp.BarcodeFormat.Aztec]
-            mask = ink_mask(img)
             pages.append(
                 ScannedPage(
                     source=pdf_path,
@@ -275,9 +394,8 @@ def scan_stack(pdf_path: Path) -> list[ScannedPage]:
                     serial=serial,
                     aztec=aztecs[0] if aztecs else None,
                     bubblesheet=len(detect_bubblesheet_markers(img)) >= 3,
-                    thumb=thumbnail(img).astype(np.float16),
-                    ink=np.packbits(mask),
-                    ink_shape=mask.shape,
+                    image=cv2.imencode(".png", align_image(img))[1].tobytes(),
+                    blank=marked_fraction(img) < BLANK_PAGE_THRESHOLD,
                     warnings=warnings,
                 )
             )
@@ -430,9 +548,12 @@ class Template:
     bubblesheet_anchor: dict[int, np.ndarray]  # ArUco corners on the bubblesheet
     cover_boxes: dict[str, Box]
     bubblesheet_boxes: dict[str, Box]
+    prefilled: set[str]  # bubblesheet boxes printed on the template (e.g. per-student versions)
     is_cover: list[bool]
     is_bubblesheet: list[bool]
     similar: list[SimilarPages]
+    header_kp: tuple  # ORB keypoints/descriptors of the ink most pages share, at ALIGN_DPI
+    header_des: np.ndarray | None
 
     @property
     def version(self) -> str:
@@ -440,12 +561,11 @@ class Template:
 
     @classmethod
     def load(cls, path: Path, aztec: str) -> "Template":
-        thumbs, imgs, covers, bubbles, aztec_corners, markers = [], [], [], [], {}, {}
+        imgs, covers, bubbles, aztec_corners, markers = [], [], [], {}, {}
         with pymupdf.open(path) as doc:
             for index, page in enumerate(doc):
                 img = to_gray(page)
                 imgs.append(img)
-                thumbs.append(thumbnail(img))
                 found = [
                     r
                     for r in zxingcpp.read_barcodes(img, formats=zxingcpp.BarcodeFormat.Aztec)
@@ -465,17 +585,25 @@ class Template:
                 )
             cover_index, bubblesheet_index = covers.index(True), bubbles.index(True)
             cover_boxes = {k: find_box(doc[cover_index], v) for k, v in COVER_LABELS.items()}
-            inks = [ink_mask(img) for img in imgs]
-            common = np.mean(inks, axis=0) >= 0.5
-            common = cv2.dilate(common.astype(np.uint8), np.ones((3, 3))).astype(bool)
             bubblesheet_boxes = {
                 k: find_box(doc[bubblesheet_index], v) for k, v in BUBBLESHEET_LABELS.items()
             }
+        aligns = [align_image(img) for img in imgs]
+        thumbs, inks = zip(*(features(a) for a in aligns))
+        common = np.mean(inks, axis=0) >= 0.5
+        common = cv2.dilate(common.astype(np.uint8), np.ones((3, 3))).astype(bool)
+        header = np.where(np.mean([a < 160 for a in aligns], axis=0) >= 0.5, 0, 255)
+        header_kp, header_des = _ORB.detectAndCompute(header.astype(np.uint8), None)
+        prefilled = {
+            k
+            for k, box in bubblesheet_boxes.items()
+            if ink_fraction(printed_ink(imgs[bubblesheet_index], box), box) >= INK_THRESHOLD
+        }
         return cls(
             path=path,
             aztec=aztec,
-            thumbs=thumbs,
-            inks=inks,
+            thumbs=list(thumbs),
+            inks=list(inks),
             distinct=[ink & ~common for ink in inks],
             cover_index=cover_index,
             bubblesheet_index=bubblesheet_index,
@@ -485,18 +613,45 @@ class Template:
             bubblesheet_anchor=markers[bubblesheet_index],
             cover_boxes=cover_boxes,
             bubblesheet_boxes=bubblesheet_boxes,
+            prefilled=prefilled,
             is_cover=covers,
             is_bubblesheet=bubbles,
-            similar=[SimilarPages.build(c, imgs) for c in _similar_classes(thumbs)],
+            similar=[SimilarPages.build(c, imgs) for c in _similar_classes(list(thumbs))],
+            header_kp=header_kp,
+            header_des=header_des,
         )
 
-    def cost_matrix(self, pages: list[ScannedPage]) -> np.ndarray:
+    def align_pages(self, pages: list[ScannedPage]) -> list[np.ndarray]:
+        """Per page, a 2x3 transform from its ALIGN_DPI image into this template's frame.
+
+        Pages whose header can't be matched get the median transform of the other pages from
+        the same file (or the identity if there are none).
+        """
+        found = [
+            estimate_alignment(p.align_image(), self.header_kp, self.header_des) for p in pages
+        ]
+        by_file = defaultdict(list)
+        for p, t in zip(pages, found):
+            if t is not None:
+                by_file[p.source].append(t)
+        fallback = {f: np.median(ts, axis=0) for f, ts in by_file.items()}
+        identity = np.eye(2, 3, dtype=np.float64)
+        return [
+            t if t is not None else fallback.get(p.source, identity) for p, t in zip(pages, found)
+        ]
+
+    def cost_matrix(
+        self, pages: list[ScannedPage], transforms: list[np.ndarray] | None = None
+    ) -> np.ndarray:
         """Matching cost of each scanned page (rows) against each template page (columns)."""
-        scan = np.stack([p.thumb.ravel().astype(np.float32) for p in pages])
+        if transforms is None:
+            transforms = self.align_pages(pages)
+        shape = letter_size(ALIGN_DPI)[::-1]
+        feats = [features(warp_to(p.align_image(), t, shape)) for p, t in zip(pages, transforms)]
+        scan = np.stack([thumb.ravel() for thumb, _ in feats])
         tpl = np.stack([t.ravel() for t in self.thumbs])
         cost = 1.0 - scan @ tpl.T
-        for i, page in enumerate(pages):
-            scan_ink = page.ink_mask()
+        for i, (_, scan_ink) in enumerate(feats):
             cost[i] += [
                 ink_recall_cost(scan_ink, ink, distinct)
                 for ink, distinct in zip(self.inks, self.distinct)
@@ -528,16 +683,15 @@ class Template:
         return slots
 
 
-def find_template(templates_dir: Path, aztec: str) -> Path:
+def find_template(templates_dir: Path, aztec: str) -> Path | None:
+    """``templates/<aztec>.pdf`` (or ``<version>.pdf``), or None if neither exists."""
     for candidate in (
         templates_dir / f"{aztec}.pdf",
         templates_dir / f"{version_label(aztec)}.pdf",
     ):
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(
-        f"No template for version {aztec!r}: expected {templates_dir / f'{aztec}.pdf'}"
-    )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +726,18 @@ def new_ink(registered: np.ndarray, template_img: np.ndarray, box: Box) -> np.nd
     return mask
 
 
+def printed_ink(template_img: np.ndarray, box: Box) -> np.ndarray:
+    """Mask of ink printed in ``box``'s writing area on the template itself."""
+    x0, y0, x1, y1 = _px(box.rect)
+    mask = np.zeros((y1 - y0, x1 - x0), bool)
+    ax0, ay0, ax1, ay1 = _px(box.writing_area)
+    inset = int(4 * DPI / 72)
+    ys = slice(max(ay0 - y0, 0) + inset, ay1 - y0 - inset)
+    xs = slice(max(ax0 - x0, 0) + inset, ax1 - x0 - inset)
+    mask[ys, xs] = template_img[y0:y1, x0:x1][ys, xs] < 160
+    return mask
+
+
 def ink_fraction(mask: np.ndarray, box: Box) -> float:
     x0, y0, x1, y1 = _px(box.writing_area)
     return float(mask.sum()) / max((x1 - x0) * (y1 - y0), 1)
@@ -592,7 +758,13 @@ def handwriting_png(registered: np.ndarray, box: Box, mask: np.ndarray) -> bytes
     return buf.tobytes()
 
 
-def register(img: np.ndarray, scan_pts: np.ndarray, tpl_pts: np.ndarray, homography: bool):
+def register(
+    img: np.ndarray,
+    scan_pts: np.ndarray,
+    tpl_pts: np.ndarray,
+    template_img: np.ndarray,
+    homography: bool,
+):
     """Return (scan warped into the template frame, 3x3 template->scan pixel transform)."""
     if homography:
         h, _ = cv2.findHomography(scan_pts, tpl_pts)
@@ -600,7 +772,11 @@ def register(img: np.ndarray, scan_pts: np.ndarray, tpl_pts: np.ndarray, homogra
         a, _ = cv2.estimateAffinePartial2D(scan_pts, tpl_pts)
         h = np.vstack([a, [0, 0, 1]])
     warped = cv2.warpPerspective(
-        img, h, (img.shape[1], img.shape[0]), borderValue=255, flags=cv2.INTER_LINEAR
+        img,
+        h,
+        (template_img.shape[1], template_img.shape[0]),
+        borderValue=255,
+        flags=cv2.INTER_LINEAR,
     )
     return warped, np.linalg.inv(h)
 
@@ -630,7 +806,9 @@ def registered_cover(page: pymupdf.Page | None, template: Template):
     if not found:
         raise ValueError("cover Aztec code not found on re-read")
     # The Aztec code only pins down one corner of the page; ECC aligns the rest.
-    warped, _ = register(img, barcode_corners(found[0]), template.cover_anchor, homography=False)
+    warped, _ = register(
+        img, barcode_corners(found[0]), template.cover_anchor, template.cover_img, homography=False
+    )
     return refine_alignment(warped, template.cover_img)
 
 
@@ -668,7 +846,7 @@ def fill_bubblesheet(
     warnings: list[str] = []
     img = to_gray(bubble_page)
     if inserted:
-        registered, tpl_to_scan = img, np.eye(3)
+        registered, tpl_to_scan = template.bubblesheet_img, np.eye(3)
     else:
         markers = detect_bubblesheet_markers(img)
         common = sorted(set(markers) & set(template.bubblesheet_anchor))
@@ -676,7 +854,9 @@ def fill_bubblesheet(
             return {}, ["bubblesheet markers not found; Name/ID not checked"]
         scan_pts = np.concatenate([markers[i] for i in common])
         tpl_pts = np.concatenate([template.bubblesheet_anchor[i] for i in common])
-        registered, tpl_to_scan = register(img, scan_pts, tpl_pts, homography=len(common) >= 2)
+        registered, tpl_to_scan = register(
+            img, scan_pts, tpl_pts, template.bubblesheet_img, homography=True
+        )
     try:
         cover = registered_cover(cover_page, template)
     except ValueError as exc:
@@ -686,6 +866,8 @@ def fill_bubblesheet(
     filled = {}
     for key, box in template.bubblesheet_boxes.items():
         filled[key] = False
+        if key in template.prefilled:
+            continue
         mask = new_ink(registered, template.bubblesheet_img, box)
         if ink_fraction(mask, box) >= INK_THRESHOLD:
             continue
@@ -709,22 +891,58 @@ def fill_bubblesheet(
 
 
 # ---------------------------------------------------------------------------
-# Assembly
+# Exams
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Exam:
-    serial: str
+    # "serial:<serial>" for barcoded exams; for unbarcoded ones "netid:<exam>:<netid>" when
+    # personalized, else "file:<sha256 prefix>"
+    key: str
+    label: str  # the serial, or the source file name
     pages: list[ScannedPage]
+    netid: str | None = None  # personalized exams: the student
+    base: str | None = None  # personalized exams: the base version they are grouped under
     template: Template | None = None
     slots: list[int | None] = field(default_factory=list)
     extras: list[int] = field(default_factory=list)
+    dropped: list[int] = field(default_factory=list)  # totally blank unmatched pages
     filled: dict[str, bool] = field(default_factory=dict)
+    held: str | None = None  # why the exam is held back from upload
     warnings: list[str] = field(default_factory=list)
 
+    @property
+    def barcoded(self) -> bool:
+        return self.key.startswith("serial:")
+
+    @property
+    def sort_key(self) -> tuple:
+        """Barcoded exams by serial, then personalized ones by netid, then other files."""
+        if self.barcoded:
+            return (0, serial_sort_key(self.label))
+        if self.netid:
+            return (1, (1, 0, self.netid))
+        return (2, (1, 0, self.label))
+
+    @property
+    def cover_versions(self) -> list[str]:
+        return sorted({p.aztec for p in self.pages if p.aztec})
+
+    @property
+    def form(self) -> str:
+        """The version printed on the cover (per student, for personalized exams)."""
+        if self.template is not None:
+            return self.template.version
+        return ",".join(version_label(a) for a in self.cover_versions)
+
+    @property
+    def version(self) -> str:
+        """The version the exam is uploaded under."""
+        return self.base or self.form
+
     def match(self, templates: dict[str, Template], sources: dict[Path, pymupdf.Document]) -> None:
-        covers = {p.aztec for p in self.pages if p.aztec}
+        covers = set(self.cover_versions)
         if len(covers) > 1:
             self.warnings.append(f"several cover versions: {sorted(covers)}")
         if covers & templates.keys():
@@ -736,14 +954,21 @@ class Exam:
                 key=lambda t: t.cost_matrix(self.pages).min(axis=1).sum(),
             )
             self.warnings.append(f"no cover; version {self.template.version} inferred")
-        cost = self.template.cost_matrix(self.pages)
-        slots, self.extras = assign_pages(cost, MATCH_COST_THRESHOLD)
+        transforms = self.template.align_pages(self.pages)
+        cost = self.template.cost_matrix(self.pages, transforms)
+        slots, extras = assign_pages(cost, MATCH_COST_THRESHOLD)
 
         def render(i: int) -> np.ndarray:
+            """Page ``i`` at DPI, aligned to the template frame."""
             p = self.pages[i]
-            return to_gray(sources[p.source][p.index])
+            t = transforms[i].copy()
+            t[:, 2] *= DPI / ALIGN_DPI  # same similarity, in DPI pixels
+            img = fit_letter(to_gray(sources[p.source][p.index]))
+            return warp_to(img, t, letter_size(DPI)[::-1])
 
         self.slots = self.template.refine(slots, render)
+        self.extras = [i for i in extras if not self.pages[i].blank]
+        self.dropped = [i for i in extras if self.pages[i].blank]
         for j, slot in enumerate(self.slots):
             if slot is None:
                 self.warnings.append(f"template page {j + 1} missing; blank template inserted")
@@ -757,117 +982,365 @@ class Exam:
         return refs + [self.pages[i].ref for i in self.extras]
 
     def is_identity(self) -> bool:
-        return self.slots == list(range(len(self.slots))) and not self.extras
+        return self.slots == list(range(len(self.slots))) and not self.extras and not self.dropped
 
 
-def _append_exam(out: pymupdf.Document, exam: Exam, sources: dict, template_doc) -> int:
-    """Append the exam's pages to ``out``; return the output index of its bubblesheet."""
-    bubble_out = None
+def group_exams(
+    pages_by_file: dict[Path, list[ScannedPage]], hashes: dict[Path, str]
+) -> tuple[list[Exam], list[ScannedPage]]:
+    """Group scanned pages into exams; return (exams, pages that belong to no exam).
+
+    In a file where some page carries an exam serial, pages are grouped by serial (across all
+    files, so an exam split between files is reassembled); pages without one are unassigned. A
+    file where no page carries a serial is a single unbarcoded exam.
+    """
+    by_serial: dict[str, list[ScannedPage]] = defaultdict(list)
+    exams, unassigned = [], []
+    for path, pages in pages_by_file.items():
+        if any(p.serial for p in pages):
+            for p in pages:
+                (by_serial[p.serial] if p.serial else unassigned).append(p)
+        else:
+            exams.append(Exam(key=f"file:{hashes[path][:16]}", label=path.name, pages=pages))
+    exams += [Exam(key=f"serial:{s}", label=s, pages=ps) for s, ps in by_serial.items()]
+    return exams, unassigned
+
+
+def read_personalized(path: Path) -> list[dict[str, str]]:
+    """Rows of the personalized-exams CSV, or [] if there is none."""
+    if not path.exists():
+        return []
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def base_version(
+    aztec: str, rows: list[dict[str, str]], existing: set[str]
+) -> tuple[str, str | None] | None:
+    """For a personalized exam's Aztec text, (netid, base version or None); None if it isn't one.
+
+    The Aztec stem is ``<exam>-<netid>``. The student's CSV row is the one with that netid
+    whose exam globs match ``<exam>``; the base version is ``<exam>-<label>`` for the first of
+    its version labels in ``existing`` (version stems with a template), as in the
+    personalization script.
+    """
+    exam, _, netid = version_label(aztec).partition("-")
+    for row in rows:
+        if row["netid"].strip() != netid:
+            continue
+        if not any(fnmatch(exam, pattern) for pattern in row["exam"].split()):
+            continue
+        for label in row["version"].split():
+            if f"{exam}-{label}" in existing:
+                return netid, f"{exam}-{label}"
+        return netid, None
+    return None
+
+
+def personalize(exam: Exam, rows: list[dict[str, str]], existing: set[str]) -> None:
+    """Give an unbarcoded personalized exam its netid key and base version."""
+    if exam.barcoded or len(exam.cover_versions) != 1:
+        return
+    found = base_version(exam.cover_versions[0], rows, existing)
+    if found is None:
+        return
+    exam.netid, exam.base = found
+    exam.key = f"netid:{exam.form.partition('-')[0]}:{exam.netid}"
+    if exam.base is None:
+        exam.warnings.append(
+            f"personalized for {exam.netid}, but no template for any of their versions; "
+            f"kept as {exam.form}"
+        )
+
+
+def hold_reason(
+    exam: Exam, emitted: dict[str, str], unbarcoded_forms: dict[str, str]
+) -> str | None:
+    """Why ``exam`` should be held back from upload, or None.
+
+    ``emitted`` maps exam keys already emitted to their batch; ``unbarcoded_forms`` maps cover
+    versions (forms) already emitted for unbarcoded exams to their batch.
+    """
+    if exam.key in emitted:
+        return f"already emitted in batch {emitted[exam.key]}"
+    if not exam.barcoded:
+        covers = sum(p.aztec is not None for p in exam.pages)
+        if covers > 1:
+            return f"{covers} covers in one unbarcoded file; split it by hand"
+        if exam.form in unbarcoded_forms:
+            return (
+                f"version {exam.form} already emitted in batch "
+                f"{unbarcoded_forms[exam.form]} (rescan?)"
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Ledgers
+# ---------------------------------------------------------------------------
+
+FILES_FIELDS = ["batch", "file", "sha256", "pages"]
+EXAMS_FIELDS = ["batch", "key", "label", "version", "form", "status", "sources"]
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_ledger(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_ledger(path: Path, fields: list[str], rows: list[dict]) -> None:
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def new_batch_name(out_root: Path) -> str:
+    base = datetime.now().astimezone().strftime("%Y-%m-%dT%H%M")
+    name, n = base, 1
+    while (out_root / name).exists():
+        n += 1
+        name = f"{base}-{n}"
+    return name
+
+
+def forget_batch(out_root: Path, batch: str) -> None:
+    """Delete a batch folder and its ledger rows, so its raw files are processed again."""
+    found = False
+    for name, fields in ((FILES_LEDGER, FILES_FIELDS), (EXAMS_LEDGER, EXAMS_FIELDS)):
+        rows = read_ledger(out_root / name)
+        keep = [r for r in rows if r["batch"] != batch]
+        if len(keep) != len(rows):
+            found = True
+            write_ledger(out_root / name, fields, keep)
+            logger.info(f"{name}: removed {len(rows) - len(keep)} rows of batch {batch}")
+    if (out_root / batch).is_dir():
+        found = True
+        shutil.rmtree(out_root / batch)
+        logger.info(f"Deleted {out_root / batch}")
+    if not found:
+        logger.warning(f"No batch {batch!r} in {out_root}")
+
+
+# ---------------------------------------------------------------------------
+# Assembly
+# ---------------------------------------------------------------------------
+
+
+def _append_exam(
+    out: pymupdf.Document, exam: Exam, sources: dict, template_doc: pymupdf.Document
+) -> int:
+    """Append the exam's pages to ``out``, filling its bubblesheet; return the bubblesheet index."""
+    template = exam.template
+    start = out.page_count
     order = [(j, s) for j, s in enumerate(exam.slots)] + [(None, i) for i in exam.extras]
     for j, s in order:
-        if j == exam.template.bubblesheet_index:
-            bubble_out = out.page_count
         if s is None:
             out.insert_pdf(template_doc, from_page=j, to_page=j)
         else:
             p = exam.pages[s]
             out.insert_pdf(sources[p.source], from_page=p.index, to_page=p.index)
+    bubble_out = start + template.bubblesheet_index
+    cover_page = (
+        out[start + template.cover_index] if exam.slots[template.cover_index] is not None else None
+    )
+    inserted = exam.slots[template.bubblesheet_index] is None
+    exam.filled, warnings = fill_bubblesheet(out[bubble_out], cover_page, template, inserted)
+    exam.warnings += warnings
     return bubble_out
 
 
-def process_exam_dir(raw_dir: Path, output_dir: Path) -> None:
-    """Reorganize every scanned stack in ``raw_dir`` into per-version PDFs in ``output_dir``."""
-    stacks = sorted(raw_dir.glob("*.pdf"))
-    if not stacks:
-        logger.warning(f"No scanned PDFs in {raw_dir}")
-        return
-    pages = [p for stack in stacks for p in scan_stack(stack)]
+def _save(doc: pymupdf.Document, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(path, garbage=3, deflate=True)
+    doc.close()
 
-    by_serial: dict[str, list[ScannedPage]] = defaultdict(list)
-    unassigned = []
-    for p in pages:
-        (by_serial[p.serial] if p.serial else unassigned).append(p)
+
+def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Path | None:
+    """Process the raw PDFs in ``raw_dir`` not processed before into a new batch in ``out_root``.
+
+    Returns the batch folder, or None if nothing was written.
+    """
+    files_ledger = read_ledger(out_root / FILES_LEDGER)
+    exams_ledger = read_ledger(out_root / EXAMS_LEDGER)
+    seen = {r["sha256"]: r["batch"] for r in files_ledger}
+
+    hashes: dict[Path, str] = {}
+    for path in sorted(raw_dir.glob("*.pdf")):
+        sha = file_sha256(path)
+        if sha in seen:
+            logger.debug(f"{path.name}: already processed in batch {seen[sha]}")
+        elif sha in hashes.values():
+            logger.warning(f"{path.name}: identical to another new file; skipped")
+        else:
+            hashes[path] = sha
+    if not hashes:
+        logger.info(f"{raw_dir.name}: no new scanned PDFs")
+        return None
+
+    pages_by_file = {path: scan_stack(path) for path in hashes}
+    exams, unassigned = group_exams(pages_by_file, hashes)
     for p in unassigned:
         logger.warning(f"{p.ref}: no serial number; left out of the output")
+    rows = read_personalized(PERSONALIZED_CSV)
+    existing = {version_label(p.stem) for p in (raw_dir / "templates").glob("*.pdf")}
+    for exam in exams:
+        personalize(exam, rows, existing)
+    aztecs = sorted({a for e in exams for a in e.cover_versions})
+    template_paths = {a: find_template(raw_dir / "templates", a) for a in aztecs}
+    missing = [a for a, p in template_paths.items() if p is None]
 
-    aztecs = sorted({p.aztec for p in pages if p.aztec})
-    templates = {a: Template.load(find_template(raw_dir / "templates", a), a) for a in aztecs}
-    exams = [Exam(serial, ps) for serial, ps in by_serial.items()]
-    output_dir.mkdir(parents=True, exist_ok=True)
-    sources = {s: pymupdf.open(s) for s in stacks}
+    if dry_run:
+        logger.info(
+            f"{raw_dir.name}: {len(hashes)} new files: {', '.join(p.name for p in hashes)}"
+        )
+        for exam in sorted(exams, key=lambda e: e.sort_key):
+            logger.info(f"  {exam.label}: {len(exam.pages)} pages, version {exam.version or '?'}")
+        for a in missing:
+            logger.warning(f"missing template: {raw_dir / 'templates' / f'{a}.pdf'}")
+        return None
+    if missing:
+        raise FileNotFoundError(
+            "Missing templates (nothing written): "
+            + ", ".join(str(raw_dir / "templates" / f"{a}.pdf") for a in missing)
+        )
+
+    templates = {a: Template.load(p, a) for a, p in template_paths.items()}
+    batch = new_batch_name(out_root)
+    batch_dir = out_root / batch
+    emitted = {r["key"]: r["batch"] for r in exams_ledger if r["status"] == "emitted"}
+    unbarcoded_forms = {
+        r.get("form") or r["version"]: r["batch"]
+        for r in exams_ledger
+        if r["status"] == "emitted" and not r["key"].startswith("serial:")
+    }
+
+    sources = {path: pymupdf.open(path) for path in hashes}
+    template_docs = {t.aztec: pymupdf.open(t.path) for t in templates.values()}
     try:
-        for exam in exams:
+        for exam in sorted(exams, key=lambda e: e.sort_key):
             exam.match(templates, sources)
-        for template in templates.values():
-            version_exams = sorted(
-                (e for e in exams if e.template is template),
-                key=lambda e: serial_sort_key(e.serial),
-            )
+            exam.held = hold_reason(exam, emitted, unbarcoded_forms)
+            if exam.held:
+                exam.warnings.append(f"HELD: {exam.held}")
+            elif not exam.barcoded:
+                unbarcoded_forms[exam.form] = batch
+
+        by_version: dict[str, list[Exam]] = defaultdict(list)
+        for exam in exams:
+            if not exam.held:
+                by_version[exam.version].append(exam)
+        for version, version_exams in sorted(by_version.items()):
             exam_doc, bubble_doc = pymupdf.open(), pymupdf.open()
-            with pymupdf.open(template.path) as template_doc:
-                for exam in version_exams:
-                    bubble_out = _append_exam(exam_doc, exam, sources, template_doc)
-                    cover_slot = exam.slots[template.cover_index]
-                    cover_page = (
-                        exam_doc[bubble_out - template.bubblesheet_index + template.cover_index]
-                        if cover_slot is not None
-                        else None
-                    )
-                    inserted = exam.slots[template.bubblesheet_index] is None
-                    exam.filled, warnings = fill_bubblesheet(
-                        exam_doc[bubble_out], cover_page, template, inserted
-                    )
-                    exam.warnings += warnings
-                    bubble_doc.insert_pdf(exam_doc, from_page=bubble_out, to_page=bubble_out)
-            exam_path = output_dir / f"{template.version}.pdf"
-            bubble_path = output_dir / f"{template.version}-bubblesheets.pdf"
-            exam_doc.save(exam_path, garbage=3, deflate=True)
-            bubble_doc.save(bubble_path, garbage=3, deflate=True)
-            logger.info(
-                f"{template.version}: {len(version_exams)} exams -> {exam_path.name}, "
-                f"{bubble_path.name}"
-            )
+            for exam in sorted(version_exams, key=lambda e: e.sort_key):
+                template_doc = template_docs[exam.template.aztec]
+                bubble_out = _append_exam(exam_doc, exam, sources, template_doc)
+                bubble_doc.insert_pdf(exam_doc, from_page=bubble_out, to_page=bubble_out)
+            _save(exam_doc, batch_dir / f"{version}.pdf")
+            _save(bubble_doc, batch_dir / f"{version}-bubblesheets.pdf")
+            logger.info(f"{version}: {len(version_exams)} exams")
+
+        for exam in (e for e in exams if e.held):
+            doc = pymupdf.open()
+            _append_exam(doc, exam, sources, template_docs[exam.template.aztec])
+            _save(doc, batch_dir / "held" / f"{Path(exam.label).stem}.pdf")
     finally:
-        for doc in sources.values():
+        for doc in [*sources.values(), *template_docs.values()]:
             doc.close()
 
-    _write_report(output_dir / "report.csv", exams, unassigned)
-    flagged = [e for e in exams if e.warnings]
-    for exam in flagged:
-        for w in exam.warnings:
-            logger.warning(f"serial {exam.serial}: {w}")
-    reordered = [e.serial for e in exams if not e.is_identity()]
-    if reordered:
-        logger.info(f"Pages reordered/patched for serials: {', '.join(sorted(reordered))}")
-    logger.success(
-        f"{raw_dir.name}: {len(exams)} exams, {len(flagged)} with warnings, "
-        f"{len(unassigned)} unassigned pages -> {output_dir}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    _write_report(batch_dir / "report.csv", exams, unassigned)
+    write_ledger(
+        out_root / FILES_LEDGER,
+        FILES_FIELDS,
+        files_ledger
+        + [
+            {"batch": batch, "file": p.name, "sha256": sha, "pages": len(pages_by_file[p])}
+            for p, sha in hashes.items()
+        ],
     )
+    write_ledger(
+        out_root / EXAMS_LEDGER,
+        EXAMS_FIELDS,
+        exams_ledger
+        + [
+            {
+                "batch": batch,
+                "key": e.key,
+                "label": e.label,
+                "version": e.version,
+                "form": e.form,
+                "status": "held" if e.held else "emitted",
+                "sources": " ".join(sorted({p.source.name for p in e.pages})),
+            }
+            for e in sorted(exams, key=lambda e: e.sort_key)
+        ],
+    )
+
+    for exam in exams:
+        for w in exam.warnings:
+            logger.warning(f"{exam.label}: {w}")
+    held = [e for e in exams if e.held]
+    logger.success(
+        f"{raw_dir.name}: batch {batch}: {len(exams) - len(held)} exams for upload, "
+        f"{len(held)} held, {len(unassigned)} unassigned pages -> {batch_dir}"
+    )
+    return batch_dir
 
 
 def _write_report(path: Path, exams: list[Exam], unassigned: list[ScannedPage]) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["serial", "version", "pages", "reordered", "name_filled", "id_filled", "warnings"]
+            [
+                "exam",
+                "version",
+                "form",
+                "netid",
+                "status",
+                "pages",
+                "reordered",
+                "dropped_blank",
+                "name_filled",
+                "id_filled",
+                "warnings",
+            ]
         )
-        for exam in sorted(exams, key=lambda e: serial_sort_key(e.serial)):
+        for exam in sorted(exams, key=lambda e: e.sort_key):
             writer.writerow(
                 [
-                    exam.serial,
-                    exam.template.version,
+                    exam.label,
+                    exam.version,
+                    exam.form,
+                    exam.netid or "",
+                    "held" if exam.held else "emitted",
                     " ".join(exam.page_refs()),
                     not exam.is_identity(),
+                    " ".join(exam.pages[i].ref for i in exam.dropped),
                     exam.filled.get("name", False),
                     exam.filled.get("id", False),
                     "; ".join(exam.warnings),
                 ]
             )
         for p in unassigned:
-            writer.writerow(["", "", p.ref, "", "", "", "no serial number; not in output"])
+            writer.writerow(
+                ["", "", "", "", "unassigned", p.ref, "", "", "", "", "no serial number"]
+            )
 
 
-def process_all(exam_dirs: list[Path] | None = None) -> None:
+def process_all(
+    exam_dirs: list[Path] | None = None, dry_run: bool = False, forget: str | None = None
+) -> None:
     """Process the given exam directories, or every subdirectory of ``RAW_DATA_DIR/artifacts``."""
     if not exam_dirs:
         exam_dirs = sorted(d for d in ARTIFACTS_RAW_DIR.glob("*") if d.is_dir())
@@ -880,4 +1353,8 @@ def process_all(exam_dirs: list[Path] | None = None) -> None:
             rel = raw_dir.relative_to(ARTIFACTS_RAW_DIR.resolve())
         except ValueError:
             rel = Path(raw_dir.name)
-        process_exam_dir(raw_dir, ARTIFACTS_PROCESSED_DIR / rel)
+        out_root = ARTIFACTS_PROCESSED_DIR / rel
+        if forget:
+            forget_batch(out_root, forget)
+        else:
+            process_exam_dir(raw_dir, out_root, dry_run=dry_run)
