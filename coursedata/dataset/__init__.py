@@ -17,6 +17,7 @@ import typer
 from coursedata.config import DAILY_CONFIG
 
 from . import albert as _albert
+from . import artifacts as _artifacts
 from . import brightspace as _brightspace
 from . import calendars as _calendars
 from . import drive as _drive
@@ -234,6 +235,19 @@ def process_sections_cmd(
 def process_photo_rosters_cmd() -> None:
     """Convert the latest Albert photo rosters to JSON and Anki decks."""
     _photo_rosters.process_all()
+
+
+@process_app.command("artifacts")
+def process_artifacts_cmd(
+    exam_dirs: Annotated[
+        Optional[list[Path]],
+        typer.Argument(
+            help="Exam directories of scanned PDFs (default: every subdirectory of RAW_DATA_DIR/artifacts)"
+        ),
+    ] = None,
+) -> None:
+    """Reorganize scanned exam stacks into per-version PDFs and bubblesheets for Gradescope."""
+    _artifacts.process_all(exam_dirs)
 
 
 @process_app.command("webassign")

@@ -31,6 +31,12 @@ dependencies = [
     "scikit-learn",
     "keyring",
     "reportlab",
+    # Scanned exam processing (coursedata.dataset.artifacts)
+    "opencv-python-headless",
+    "pillow",
+    "pymupdf",
+    "scipy",
+    "zxing-cpp",
     "nyu-colors @ git+https://github.com/nyumathclinic/nyu-colors.git@v1.0.0",
     # If changes are pushed to main, update with
     # uv lock --upgrade-package python-edubag && uv sync
