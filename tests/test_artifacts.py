@@ -214,3 +214,214 @@ def test_personalize_sets_key_and_version():
     assert (exam.netid, exam.form, exam.version) == ("alt9145", "ch6-alt9145", "ch6-21A")
     # A rescan of the same student's exam is held by its key.
     assert "already emitted" in hold_reason(exam, {"netid:ch6:alt9145": "B1"}, {})
+
+
+# ---------------------------------------------------------------------------
+# Gradescope submission exports
+# ---------------------------------------------------------------------------
+
+import itertools  # noqa: E402
+import zipfile  # noqa: E402
+
+import cv2  # noqa: E402
+import pymupdf  # noqa: E402
+import zxingcpp  # noqa: E402
+
+from coursedata.dataset import artifacts  # noqa: E402
+from coursedata.dataset.artifacts import (  # noqa: E402
+    ExportSubmission,
+    Template,
+    duplicate_reason,
+    read_export,
+    register_bubblesheet,
+    resolve_export_versions,
+    stamp_bubblesheet,
+)
+
+METADATA = """---
+101.pdf:
+  :submitters:
+  - :name: Ada Lovelace
+    :sid: N12345678
+    :email: al123@nyu.edu
+  :created_at: 2026-10-15 17:00:00.000000000 -04:00
+  :score: 0.0
+  :original_filename: 2026101517.pdf
+22.pdf:
+  :submitters:
+  - :name: Alan Turing
+    :sid: N87654321
+    :email: amt4@nyu.edu
+  :original_filename: t1-A.pdf
+"""
+
+
+def _png(img: np.ndarray) -> bytes:
+    return cv2.imencode(".png", img)[1].tobytes()
+
+
+def _aztec(text: str) -> np.ndarray:
+    try:
+        return np.array(
+            zxingcpp.write_barcode_to_image(
+                zxingcpp.create_barcode(text, zxingcpp.BarcodeFormat.Aztec), scale=8
+            )
+        )
+    except AttributeError:  # older zxing-cpp
+        return np.array(zxingcpp.write_barcode(zxingcpp.BarcodeFormat.Aztec, text, 200, 200))
+
+
+@pytest.fixture(scope="module")
+def template(tmp_path_factory) -> Template:
+    """A two-page template: a cover (Aztec + Name/NetID boxes) and a bubblesheet (ArUco + Name/ID)."""
+    path = tmp_path_factory.mktemp("templates") / "t1-A.qns.pdf"
+    doc = pymupdf.open()
+    cover = doc.new_page(width=612, height=792)
+    cover.insert_image(pymupdf.Rect(450, 40, 560, 150), stream=_png(_aztec("t1-A.qns")))
+    for y, label in ((200, "Name:"), (260, "NetID:")):
+        cover.draw_rect(pymupdf.Rect(72, y, 540, y + 40), color=(0, 0, 0), width=1)
+        cover.insert_text((78, y + 24), label, fontsize=12)
+    bubble = doc.new_page(width=612, height=792)
+    dictionary = cv2.aruco.getPredefinedDictionary(artifacts.ARUCO_DICT)
+    for i, (x, y) in enumerate(((36, 36), (516, 36), (516, 696), (36, 696))):
+        marker = cv2.copyMakeBorder(
+            cv2.aruco.generateImageMarker(dictionary, i, 120), 12, 12, 12, 12,
+            cv2.BORDER_CONSTANT, value=255,
+        )  # fmt: skip
+        bubble.insert_image(pymupdf.Rect(x, y, x + 60, y + 60), stream=_png(marker))
+    for y, label in ((150, "Name"), (210, "ID")):
+        bubble.draw_rect(pymupdf.Rect(72, y, 540, y + 40), color=(0, 0, 0), width=1)
+        bubble.insert_text((78, y + 24), label, fontsize=12)
+    doc.save(path)
+    return Template.load(path, "t1-A.qns")
+
+
+def _bubblesheet_page(template: Template, quarter_turns: int = 0, rotation: int = 0):
+    """A 'scan' of the blank bubblesheet: its image turned ``quarter_turns`` times, shown with
+    /Rotate ``rotation``."""
+    img = np.ascontiguousarray(np.rot90(template.bubblesheet_img, quarter_turns))
+    doc = pymupdf.open()
+    page = doc.new_page(width=img.shape[1] * 72 / artifacts.DPI, height=img.shape[0] * 72 / artifacts.DPI)
+    page.insert_image(page.rect, stream=_png(img))
+    page.set_rotation(rotation)
+    return doc, page
+
+
+def _box_ink(page, template: Template, key: str) -> np.ndarray:
+    registered, _ = register_bubblesheet(artifacts.to_gray(page), template)
+    return artifacts.new_ink(registered, template.bubblesheet_img, template.bubblesheet_boxes[key])
+
+
+def test_stamp_bubblesheet_types_only_in_blank_boxes(template):
+    doc, page = _bubblesheet_page(template)
+    id_area = template.bubblesheet_boxes["id"].writing_area
+    page.insert_text((id_area.x0 + 10, id_area.y0 + 24), "scribble", fontsize=14)  # student's ink
+    filled, warnings = stamp_bubblesheet(page, template, {"name": "Ada Lovelace", "id": "al123"})
+    assert filled == {"name": True, "id": False}
+    assert warnings == []
+    name_area = template.bubblesheet_boxes["name"].writing_area
+    words = [w[4] for w in page.get_text("words") if pymupdf.Rect(w[:4]).intersects(name_area)]
+    assert words == ["Ada", "Lovelace"]
+
+
+def test_stamp_bubblesheet_without_markers(template):
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    filled, warnings = stamp_bubblesheet(page, template, {"name": "Ada"})
+    assert filled == {}
+    assert "markers not found" in warnings[0]
+
+
+def test_stamp_bubblesheet_upright_in_any_orientation(template):
+    _, ref_page = _bubblesheet_page(template)
+    stamp_bubblesheet(ref_page, template, {"name": "Ada Lovelace"})
+    ref = _box_ink(ref_page, template, "name")
+    ry, rx = np.nonzero(ref)
+    ref_crop = ref[ry.min() : ry.max() + 1, rx.min() : rx.max() + 1].astype(np.float32)
+    for turns, rotation in itertools.product(range(4), (0, 90, 180, 270)):
+        _, page = _bubblesheet_page(template, turns, rotation)
+        filled, _ = stamp_bubblesheet(page, template, {"name": "Ada Lovelace"})
+        assert filled["name"], (turns, rotation)
+        mask = _box_ink(page, template, "name")
+        ys, xs = np.nonzero(mask)
+        crop = mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1].astype(np.float32)
+        # Same extent as upright text (not wrapped or sideways)...
+        assert abs(crop.shape[1] - ref_crop.shape[1]) < 30 and abs(crop.shape[0] - ref_crop.shape[0]) < 15
+        # ...and matches it better than its upside-down image does.
+        h, w = min(crop.shape[0], ref_crop.shape[0]), min(crop.shape[1], ref_crop.shape[1])
+        same = (crop[:h, :w] * ref_crop[:h, :w]).sum()
+        flipped = (crop[::-1, ::-1][:h, :w] * ref_crop[:h, :w]).sum()
+        assert same > flipped, (turns, rotation)
+
+
+def _write_export(folder: Path) -> None:
+    folder.mkdir()
+    (folder / "submission_metadata.yml").write_text(METADATA)
+    for name in ("101.pdf", "22.pdf"):
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(folder / name)
+
+
+def test_read_export_folder_and_zip(tmp_path):
+    folder = tmp_path / "assignment_9_export"
+    _write_export(folder)
+    subs = read_export(folder)
+    assert [s.submission_id for s in subs] == ["22", "101"]  # numeric order
+    ada = subs[1]
+    assert (ada.name, ada.email, ada.sid, ada.netid) == ("Ada Lovelace", "al123@nyu.edu", "N12345678", "al123")
+    assert ada.key == "submission:101"
+    assert ada.file == "assignment_9_export/101.pdf"
+    assert ada.pdf.startswith(b"%PDF")
+    assert ada.stamp_values() == {"name": "Ada Lovelace", "id": "al123"}
+
+    zipped = tmp_path / "zips" / "assignment_9_export.zip"
+    zipped.parent.mkdir()
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for f in folder.iterdir():
+            zf.write(f, f"assignment_9_export/{f.name}")
+    assert [s.submission_id for s in read_export(zipped)] == ["22", "101"]
+    assert artifacts.export_sources(zipped.parent) == [zipped]
+    assert artifacts.export_sources(tmp_path) == [folder]
+
+
+def test_read_export_rejects_group_submissions(tmp_path):
+    folder = tmp_path / "assignment_9_export"
+    _write_export(folder)
+    text = METADATA.replace(
+        "    :email: al123@nyu.edu\n",
+        "    :email: al123@nyu.edu\n  - :name: Bo\n    :sid: N1\n    :email: bo1@nyu.edu\n",
+    )
+    (folder / "submission_metadata.yml").write_text(text)
+    with pytest.raises(ValueError, match="2 submitters"):
+        read_export(folder)
+
+
+def _sub(export: str, sid: str, aztecs: list) -> ExportSubmission:
+    return ExportSubmission(
+        export=export, submission_id=sid, pdf=b"", name="", email="x@nyu.edu", sid="",
+        original_filename="", aztecs=aztecs,
+    )  # fmt: skip
+
+
+def test_resolve_export_versions():
+    rows = [{"exam": "ch6", "netid": "ak1", "name": "", "version": "16B 21A"}]
+    existing = {"ch6-21A", "ch6-21B", "ch6-ak1"}
+    subs = [
+        _sub("e1", "1", [None, "ch6-21A.qns"]),
+        _sub("e1", "2", [None, None]),  # no cover: takes the export's version
+        _sub("e1", "3", ["ch6-ak1.qns"]),  # personalized: its base version
+        _sub("e2", "4", [None]),  # no cover anywhere in its export
+    ]
+    resolve_export_versions(subs, rows, existing)
+    assert [s.version for s in subs] == ["ch6-21A", "ch6-21A", "ch6-21A", None]
+    assert "no readable cover" in subs[1].warnings[0]
+    assert subs[3].skipped and not subs[0].skipped
+
+
+def test_duplicate_reason():
+    sub = _sub("e1", "1", [])
+    sub.original_filename = "ch6-21A.pdf"
+    assert "batch b1" in duplicate_reason(sub, {"ch6-21A": "b1"})
+    sub.original_filename = "20261015171803575.pdf"
+    assert duplicate_reason(sub, {"ch6-21A": "b1"}) is None

@@ -170,3 +170,44 @@ def grading_cmd(
 
     headless = (ctx.obj or {}).get("headless", False)
     _get_impl(exam, headless=headless, scores=scores)
+
+
+@app.command("submissions")
+def submissions_cmd(
+    ctx: typer.Context,
+    exam_dir: Annotated[
+        str, typer.Argument(help="Exam folder under RAW_DATA_DIR/artifacts (e.g. ch6)")
+    ],
+    course: Annotated[str, typer.Argument(help="Gradescope course ID")],
+    ids: Annotated[
+        list[str],
+        typer.Argument(help="Assignment IDs, or assignment container IDs with --container"),
+    ],
+    container: Annotated[
+        bool, typer.Option("--container", help="IDS are version sets: export every version")
+    ] = False,
+    reuse: Annotated[
+        bool,
+        typer.Option("--reuse", help="Download an existing completed export instead of a new one"),
+    ] = False,
+) -> None:
+    """Export submissions from Gradescope into an exam folder, for `process artifacts`.
+
+    Each assignment lands in RAW_DATA_DIR/artifacts/EXAM_DIR/assignment_<id>_export/ (replacing
+    an earlier download), which `process artifacts` turns into bubblesheet PDFs.
+    """
+    if not EDUBAG_AVAILABLE:
+        logger.error("edubag module is not available. Cannot export Gradescope submissions.")
+        raise typer.Exit(code=1)
+    headless = (ctx.obj or {}).get("headless", False)
+    save_dir = RAW_DATA_DIR / "artifacts" / exam_dir
+    username, password = _get_gradescope_credentials()
+    client = GradescopeClient()
+    options = dict(fresh=not reuse, headless=headless, username=username, password=password)
+    for item in ids:
+        if container:
+            paths = client.export_container_submissions(course, item, save_dir, **options)
+        else:
+            paths = client.save_submissions_export(course, [item], save_dir, **options)
+        for path in paths:
+            logger.success(f"Saved submissions export to {path}")

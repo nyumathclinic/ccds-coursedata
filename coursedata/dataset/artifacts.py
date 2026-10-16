@@ -25,12 +25,20 @@ writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<
   unbarcoded exam of an already-emitted unbarcoded version). Not for upload; resolve by hand.
 * ``report.csv``: one row per exam, recording the page mapping, fills, and any warnings.
 
+Gradescope submission exports (``assignment_<id>_export/`` folders or ``.zip`` files in the exam
+directory, from "Export Submissions" or ``dataset get gradescope submissions``) are exams already
+uploaded and matched to students, e.g. to the free-response part. Only their bubblesheets are
+emitted, into the same ``<version>-bubblesheets.pdf`` files, for the multiple-choice part: a blank
+Name or ID box gets the student's name and NetID (or ``stamp_id = "sid"``) typed in, and
+``bubblesheets.csv`` lists whose bubblesheet is on each page. A submission uploaded from an earlier
+batch's ``<version>.pdf`` is skipped, since that batch already has its bubblesheet.
+
 Here ``<version>`` is the Aztec text without its extension (``ch6-16A``). The ledgers
 ``processed_files.csv`` and ``processed_exams.csv`` next to the batch folders record what has been
 processed; ``--forget BATCH`` deletes a batch and its ledger rows so it can be redone.
 """
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,12 +47,14 @@ import hashlib
 from pathlib import Path
 import re
 import shutil
+import zipfile
 
 import cv2
 from loguru import logger
 import numpy as np
 import pymupdf
 from scipy.optimize import linear_sum_assignment
+import yaml
 import zxingcpp
 
 from coursedata.config import PROCESSED_DATA_DIR, RAW_DATA_DIR, _config
@@ -839,6 +849,20 @@ def refine_alignment(img: np.ndarray, template_img: np.ndarray) -> np.ndarray:
     )
 
 
+def register_bubblesheet(img: np.ndarray, template: Template):
+    """(scan warped into the template frame, template->scan transform) by the ArUco markers.
+
+    None if fewer than two of the template's markers are found on the scan.
+    """
+    markers = detect_bubblesheet_markers(img)
+    common = sorted(set(markers) & set(template.bubblesheet_anchor))
+    if len(common) < 2:
+        return None
+    scan_pts = np.concatenate([markers[i] for i in common])
+    tpl_pts = np.concatenate([template.bubblesheet_anchor[i] for i in common])
+    return register(img, scan_pts, tpl_pts, template.bubblesheet_img, homography=True)
+
+
 def fill_bubblesheet(
     bubble_page: pymupdf.Page, cover_page: pymupdf.Page | None, template: Template, inserted: bool
 ) -> tuple[dict[str, bool], list[str]]:
@@ -848,15 +872,10 @@ def fill_bubblesheet(
     if inserted:
         registered, tpl_to_scan = template.bubblesheet_img, np.eye(3)
     else:
-        markers = detect_bubblesheet_markers(img)
-        common = sorted(set(markers) & set(template.bubblesheet_anchor))
-        if len(common) < 2:
+        found = register_bubblesheet(img, template)
+        if found is None:
             return {}, ["bubblesheet markers not found; Name/ID not checked"]
-        scan_pts = np.concatenate([markers[i] for i in common])
-        tpl_pts = np.concatenate([template.bubblesheet_anchor[i] for i in common])
-        registered, tpl_to_scan = register(
-            img, scan_pts, tpl_pts, template.bubblesheet_img, homography=True
-        )
+        registered, tpl_to_scan = found
     try:
         cover = registered_cover(cover_page, template)
     except ValueError as exc:
@@ -887,6 +906,67 @@ def fill_bubblesheet(
         )
         filled[key] = True
         logger.info(f"bubblesheet {key} was blank; filled from the cover")
+    return filled, warnings
+
+
+def text_rotation(page: pymupdf.Page, tpl_to_scan: np.ndarray) -> int:
+    """``insert_textbox`` rotation that writes text upright in a registered template's frame.
+
+    The scan may be stored sideways (and shown upright by the page's /Rotate) or shown sideways;
+    the template's x axis, mapped onto the displayed page, says which way is "along the line".
+    """
+    pts = cv2.perspectiveTransform(np.float32([[[0, 0]], [[100, 0]]]), tpl_to_scan).reshape(2, 2)
+    dx, dy = pts[1] - pts[0]
+    angle = int(round(np.degrees(np.arctan2(-dy, dx)) / 90)) % 4 * 90
+    return (page.rotation + angle) % 360
+
+
+def insert_fitting_text(
+    page: pymupdf.Page, area: pymupdf.Rect, tpl_to_scan: np.ndarray, text: str
+) -> bool:
+    """Write ``text`` in ``area`` (template points) of a registered page, shrinking it to fit.
+
+    The text is centered vertically in the template's frame. Returns False if it doesn't fit even
+    at the smallest size.
+    """
+    rotate = text_rotation(page, tpl_to_scan)
+    for size in (16, 14, 12, 11, 10, 9, 8, 7, 6):
+        # insert_textbox starts at the top of its rect.
+        pad = max((area.height - size * 1.3) / 2, 0)
+        dest = map_rect(pymupdf.Rect(area.x0, area.y0 + pad, area.x1, area.y1), tpl_to_scan)
+        if page.rotation:
+            dest = dest * page.derotation_matrix
+        if page.insert_textbox(dest, text, fontsize=size, fontname="helv", rotate=rotate) >= 0:
+            return True
+    return False
+
+
+def stamp_bubblesheet(
+    page: pymupdf.Page, template: Template, values: dict[str, str]
+) -> tuple[dict[str, bool], list[str]]:
+    """Type ``values`` (box key -> text) into the bubblesheet's blank Name/ID boxes.
+
+    A box the student wrote in, or one printed on the template, is left alone. Returns (filled
+    flags, warnings).
+    """
+    found = register_bubblesheet(to_gray(page), template)
+    if found is None:
+        return {}, ["bubblesheet markers not found; Name/ID not typed in"]
+    registered, tpl_to_scan = found
+    filled, warnings = {}, []
+    for key, box in template.bubblesheet_boxes.items():
+        filled[key] = False
+        if key in template.prefilled or not values.get(key):
+            continue
+        if ink_fraction(new_ink(registered, template.bubblesheet_img, box), box) >= INK_THRESHOLD:
+            continue
+        inset = 3
+        area = box.writing_area
+        area = pymupdf.Rect(area.x0 + inset, area.y0 + inset, area.x1 - inset, area.y1 - inset)
+        if insert_fitting_text(page, area, tpl_to_scan, values[key]):
+            filled[key] = True
+        else:
+            warnings.append(f"bubblesheet {key} blank, but {values[key]!r} does not fit in it")
     return filled, warnings
 
 
@@ -1076,6 +1156,195 @@ def hold_reason(
 
 
 # ---------------------------------------------------------------------------
+# Gradescope submission exports
+# ---------------------------------------------------------------------------
+
+EXPORT_GLOB = "assignment_*_export"
+# What to type in a blank bubblesheet ID box: "netid" (the email's local part, what the cover
+# asks for) or "sid" (Gradescope's student ID).
+STAMP_ID = ARTIFACTS_CONFIG.get("stamp_id", "netid")
+
+
+@dataclass
+class ExportSubmission:
+    """One submission of a Gradescope "Export Submissions" download, already matched to a student."""
+
+    export: str  # the export folder name, assignment_<id>_export
+    submission_id: str
+    pdf: bytes
+    name: str
+    email: str
+    sid: str
+    original_filename: str  # the file the submission was uploaded from
+    aztecs: list[str | None] = field(default_factory=list)  # per page
+    marker_pages: list[int] = field(default_factory=list)  # pages with bubblesheet markers
+    version: str | None = None
+    page_index: int | None = None  # the bubblesheet page
+    filled: dict[str, bool] = field(default_factory=dict)
+    skipped: str | None = None  # why it is left out of the output
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return f"submission:{self.submission_id}"
+
+    @property
+    def file(self) -> str:
+        return f"{self.export}/{self.submission_id}.pdf"
+
+    @property
+    def netid(self) -> str:
+        return self.email.partition("@")[0]
+
+    @property
+    def sort_key(self) -> tuple:
+        return serial_sort_key(self.submission_id)
+
+    def stamp_values(self) -> dict[str, str]:
+        return {"name": self.name, "id": self.sid if STAMP_ID == "sid" else self.netid}
+
+
+def export_sources(raw_dir: Path) -> list[Path]:
+    """Export folders in ``raw_dir``, plus export zips that haven't been extracted there."""
+    folders = sorted(d for d in raw_dir.glob(EXPORT_GLOB) if d.is_dir())
+    zips = sorted(z for z in raw_dir.glob(f"{EXPORT_GLOB}.zip") if not z.with_suffix("").is_dir())
+    return folders + zips
+
+
+def _meta(entry: dict, key: str):
+    """A submission_metadata.yml value; its keys are Ruby symbols (":name")."""
+    return entry.get(f":{key}", entry.get(key))
+
+
+def read_export(path: Path) -> list[ExportSubmission]:
+    """The submissions in a Gradescope submissions export, extracted (a folder) or zipped.
+
+    Raises:
+        ValueError: If the metadata is missing, or a submission doesn't have exactly one submitter.
+    """
+    if path.is_dir():
+        name = path.name
+        files = {p.name: p.read_bytes for p in path.iterdir() if p.is_file()}
+    else:
+        name = path.name.removesuffix(".zip")
+        with zipfile.ZipFile(path) as zf:
+            contents = {Path(m).name: zf.read(m) for m in zf.namelist() if not m.endswith("/")}
+        files = {k: (lambda v=v: v) for k, v in contents.items()}
+    if "submission_metadata.yml" not in files:
+        raise ValueError(f"{path}: no submission_metadata.yml")
+    metadata = yaml.safe_load(files["submission_metadata.yml"]()) or {}
+    submissions = []
+    for filename, entry in metadata.items():
+        submitters = _meta(entry, "submitters") or []
+        if len(submitters) != 1:
+            raise ValueError(f"{name}/{filename}: {len(submitters)} submitters; expected one")
+        if filename not in files:
+            raise ValueError(f"{name}: {filename} is in the metadata but not the export")
+        who = submitters[0]
+        submissions.append(
+            ExportSubmission(
+                export=name,
+                submission_id=Path(filename).stem,
+                pdf=files[filename](),
+                name=str(_meta(who, "name") or ""),
+                email=str(_meta(who, "email") or ""),
+                sid=str(_meta(who, "sid") or ""),
+                original_filename=str(_meta(entry, "original_filename") or ""),
+            )
+        )
+    return sorted(submissions, key=lambda sub: sub.sort_key)
+
+
+def scan_submission(sub: ExportSubmission) -> None:
+    """Read each page's cover Aztec code and bubblesheet markers."""
+    with pymupdf.open(stream=sub.pdf, filetype="pdf") as doc:
+        for index, page in enumerate(doc):
+            img = to_gray(page)
+            aztecs = [r.text for r in zxingcpp.read_barcodes(img, formats=zxingcpp.BarcodeFormat.Aztec)]
+            sub.aztecs.append(aztecs[0] if aztecs else None)
+            if len(detect_bubblesheet_markers(img)) >= 3:
+                sub.marker_pages.append(index)
+
+
+def submission_version(aztecs: list[str | None], rows: list[dict[str, str]], existing: set[str]) -> str | None:
+    """The version (template stem) a submission's cover names: its base version if personalized."""
+    for aztec in filter(None, aztecs):
+        found = base_version(aztec, rows, existing)
+        if found is not None and found[1] is not None:
+            return found[1]
+        if version_label(aztec) in existing:
+            return version_label(aztec)
+    return None
+
+
+def resolve_export_versions(
+    subs: list[ExportSubmission], rows: list[dict[str, str]], existing: set[str]
+) -> None:
+    """Set each submission's version from its cover, else that of most of its export.
+
+    An export is one Gradescope assignment, i.e. one version.
+    """
+    by_export: dict[str, list[ExportSubmission]] = defaultdict(list)
+    for sub in subs:
+        sub.version = submission_version(sub.aztecs, rows, existing)
+        by_export[sub.export].append(sub)
+    for export, group in by_export.items():
+        counts = Counter(sub.version for sub in group if sub.version)
+        if len(counts) > 1:
+            logger.warning(f"{export}: covers of several versions: {dict(counts)}")
+        majority = counts.most_common(1)[0][0] if counts else None
+        for sub in group:
+            if sub.version is not None:
+                continue
+            if majority is None:
+                sub.skipped = "no readable cover, and none in its export either; version unknown"
+            else:
+                sub.version = majority
+                sub.warnings.append(f"no readable cover; version {majority}, as for the rest of {export}")
+
+
+def duplicate_reason(sub: ExportSubmission, emitted_versions: dict[str, str]) -> str | None:
+    """Why a submission's bubblesheet was already produced: it was uploaded from a batch's output.
+
+    ``emitted_versions`` maps versions emitted from scanned PDFs to their (latest) batch.
+    """
+    stem = Path(sub.original_filename).stem
+    if stem in emitted_versions:
+        return f"uploaded from {sub.original_filename} of batch {emitted_versions[stem]}, which has its bubblesheet"
+    return None
+
+
+def find_bubblesheet_page(sub: ExportSubmission, doc: pymupdf.Document, template: Template) -> int | None:
+    """Index of the submission's bubblesheet page, or None (with a warning) if there is none.
+
+    The page with the bubblesheet markers; failing that (none or several), the page that best
+    matches the template's bubblesheet.
+    """
+    if len(sub.marker_pages) == 1:
+        return sub.marker_pages[0]
+    pages = [
+        ScannedPage(
+            source=Path(sub.file),
+            index=i,
+            serial=None,
+            aztec=sub.aztecs[i],
+            bubblesheet=i in sub.marker_pages,
+            image=cv2.imencode(".png", align_image(to_gray(page)))[1].tobytes(),
+            blank=False,
+        )
+        for i, page in enumerate(doc)
+    ]
+    cost = template.cost_matrix(pages)[:, template.bubblesheet_index]
+    best = int(np.argmin(cost))
+    which = "no page has" if not sub.marker_pages else f"{len(sub.marker_pages)} pages have"
+    if cost[best] > MATCH_COST_THRESHOLD:
+        sub.warnings.append(f"{which} bubblesheet markers, and no page looks like the bubblesheet")
+        return None
+    sub.warnings.append(f"{which} bubblesheet markers; page {best + 1} chosen by layout")
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Ledgers
 # ---------------------------------------------------------------------------
 
@@ -1166,10 +1435,14 @@ def _save(doc: pymupdf.Document, path: Path) -> None:
     doc.close()
 
 
-def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Path | None:
-    """Process the raw PDFs in ``raw_dir`` not processed before into a new batch in ``out_root``.
+def _bytes_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-    Returns the batch folder, or None if nothing was written.
+
+def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Path | None:
+    """Process the raw PDFs and submission exports in ``raw_dir`` not processed before.
+
+    Writes a new batch in ``out_root``; returns the batch folder, or None if nothing was written.
     """
     files_ledger = read_ledger(out_root / FILES_LEDGER)
     exams_ledger = read_ledger(out_root / EXAMS_LEDGER)
@@ -1184,19 +1457,41 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
             logger.warning(f"{path.name}: identical to another new file; skipped")
         else:
             hashes[path] = sha
-    if not hashes:
-        logger.info(f"{raw_dir.name}: no new scanned PDFs")
+
+    done = {r["key"] for r in exams_ledger}
+    submissions = [
+        sub for source in export_sources(raw_dir) for sub in read_export(source) if sub.key not in done
+    ]
+    if not hashes and not submissions:
+        logger.info(f"{raw_dir.name}: no new scanned PDFs or exported submissions")
         return None
+
+    # Versions emitted from scanned PDFs (not exports), for spotting re-exported submissions.
+    emitted_versions = {
+        r["version"]: r["batch"]
+        for r in exams_ledger
+        if r["status"] == "emitted" and not r["key"].startswith("submission:")
+    }
+    for sub in submissions:
+        sub.skipped = duplicate_reason(sub, emitted_versions)
+    active = [sub for sub in submissions if not sub.skipped]
+    for sub in active:
+        scan_submission(sub)
 
     pages_by_file = {path: scan_stack(path) for path in hashes}
     exams, unassigned = group_exams(pages_by_file, hashes)
     for p in unassigned:
         logger.warning(f"{p.ref}: no serial number; left out of the output")
     rows = read_personalized(PERSONALIZED_CSV)
-    existing = {version_label(p.stem) for p in (raw_dir / "templates").glob("*.pdf")}
+    template_stems = {version_label(p.stem): p.stem for p in (raw_dir / "templates").glob("*.pdf")}
+    existing = set(template_stems)
     for exam in exams:
         personalize(exam, rows, existing)
-    aztecs = sorted({a for e in exams for a in e.cover_versions})
+    resolve_export_versions(active, rows, existing)
+    active = [sub for sub in active if not sub.skipped]
+    aztecs = sorted(
+        {a for e in exams for a in e.cover_versions} | {template_stems[sub.version] for sub in active}
+    )
     template_paths = {a: find_template(raw_dir / "templates", a) for a in aztecs}
     missing = [a for a, p in template_paths.items() if p is None]
 
@@ -1206,6 +1501,15 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
         )
         for exam in sorted(exams, key=lambda e: e.sort_key):
             logger.info(f"  {exam.label}: {len(exam.pages)} pages, version {exam.version or '?'}")
+        for export, group in sorted(_group_by(submissions, lambda sub: sub.export).items()):
+            versions = Counter(sub.version for sub in group if not sub.skipped)
+            skipped = [sub for sub in group if sub.skipped]
+            logger.info(
+                f"  {export}: {len(group)} new submissions; bubblesheets by version {dict(versions)}; "
+                f"{len(skipped)} skipped"
+            )
+            for sub in skipped:
+                logger.info(f"    skip {sub.submission_id}: {sub.skipped}")
         for a in missing:
             logger.warning(f"missing template: {raw_dir / 'templates' / f'{a}.pdf'}")
         return None
@@ -1222,11 +1526,12 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
     unbarcoded_forms = {
         r.get("form") or r["version"]: r["batch"]
         for r in exams_ledger
-        if r["status"] == "emitted" and not r["key"].startswith("serial:")
+        if r["status"] == "emitted" and r["key"].split(":")[0] not in ("serial", "submission")
     }
 
     sources = {path: pymupdf.open(path) for path in hashes}
     template_docs = {t.aztec: pymupdf.open(t.path) for t in templates.values()}
+    manifest: list[dict] = []
     try:
         for exam in sorted(exams, key=lambda e: e.sort_key):
             exam.match(templates, sources)
@@ -1240,15 +1545,43 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
         for exam in exams:
             if not exam.held:
                 by_version[exam.version].append(exam)
-        for version, version_exams in sorted(by_version.items()):
+        subs_by_version = _group_by(active, lambda sub: sub.version)
+        for version in sorted(by_version.keys() | subs_by_version.keys()):
             exam_doc, bubble_doc = pymupdf.open(), pymupdf.open()
-            for exam in sorted(version_exams, key=lambda e: e.sort_key):
+            version_exams = sorted(by_version.get(version, []), key=lambda e: e.sort_key)
+            for exam in version_exams:
                 template_doc = template_docs[exam.template.aztec]
                 bubble_out = _append_exam(exam_doc, exam, sources, template_doc)
                 bubble_doc.insert_pdf(exam_doc, from_page=bubble_out, to_page=bubble_out)
-            _save(exam_doc, batch_dir / f"{version}.pdf")
+            if version_exams:
+                _save(exam_doc, batch_dir / f"{version}.pdf")
+                logger.info(f"{version}: {len(version_exams)} exams")
+            else:
+                exam_doc.close()
+            version_subs = subs_by_version.get(version, [])
+            template = templates[template_stems[version]]
+            for sub in version_subs:
+                with pymupdf.open(stream=sub.pdf, filetype="pdf") as doc:
+                    sub.page_index = find_bubblesheet_page(sub, doc, template)
+                    if sub.page_index is None:
+                        sub.skipped = "no bubblesheet page found"
+                        continue
+                    bubble_doc.insert_pdf(doc, from_page=sub.page_index, to_page=sub.page_index)
+                sub.filled, warnings = stamp_bubblesheet(bubble_doc[-1], template, sub.stamp_values())
+                sub.warnings += warnings
+                manifest.append(
+                    {
+                        "version": version,
+                        "page": bubble_doc.page_count,
+                        "submission_id": sub.submission_id,
+                        "name": sub.name,
+                        "email": sub.email,
+                        "export": sub.export,
+                    }
+                )
+            if version_subs:
+                logger.info(f"{version}: {sum(not s.skipped for s in version_subs)} exported submissions")
             _save(bubble_doc, batch_dir / f"{version}-bubblesheets.pdf")
-            logger.info(f"{version}: {len(version_exams)} exams")
 
         for exam in (e for e in exams if e.held):
             doc = pymupdf.open()
@@ -1259,7 +1592,13 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
             doc.close()
 
     batch_dir.mkdir(parents=True, exist_ok=True)
-    _write_report(batch_dir / "report.csv", exams, unassigned)
+    _write_report(batch_dir / "report.csv", exams, unassigned, submissions)
+    if manifest:
+        write_ledger(
+            batch_dir / "bubblesheets.csv",
+            ["version", "page", "submission_id", "name", "email", "export"],
+            manifest,
+        )
     write_ledger(
         out_root / FILES_LEDGER,
         FILES_FIELDS,
@@ -1267,6 +1606,15 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
         + [
             {"batch": batch, "file": p.name, "sha256": sha, "pages": len(pages_by_file[p])}
             for p, sha in hashes.items()
+        ]
+        + [
+            {
+                "batch": batch,
+                "file": sub.file,
+                "sha256": _bytes_sha256(sub.pdf),
+                "pages": len(sub.aztecs) or "",
+            }
+            for sub in submissions
         ],
     )
     write_ledger(
@@ -1284,21 +1632,53 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
                 "sources": " ".join(sorted({p.source.name for p in e.pages})),
             }
             for e in sorted(exams, key=lambda e: e.sort_key)
+        ]
+        + [
+            {
+                "batch": batch,
+                "key": sub.key,
+                "label": sub.file,
+                "version": sub.version or "",
+                "form": sub.version or "",
+                "status": "skipped" if sub.skipped else "emitted",
+                "sources": sub.export,
+            }
+            for sub in submissions
         ],
     )
 
     for exam in exams:
         for w in exam.warnings:
             logger.warning(f"{exam.label}: {w}")
+    for sub in submissions:
+        for w in sub.warnings:
+            logger.warning(f"{sub.file}: {w}")
+        if sub.skipped:
+            logger.info(f"{sub.file}: skipped: {sub.skipped}")
     held = [e for e in exams if e.held]
+    emitted_subs = [sub for sub in submissions if not sub.skipped]
     logger.success(
         f"{raw_dir.name}: batch {batch}: {len(exams) - len(held)} exams for upload, "
-        f"{len(held)} held, {len(unassigned)} unassigned pages -> {batch_dir}"
+        f"{len(held)} held, {len(unassigned)} unassigned pages; "
+        f"{len(emitted_subs)} exported submissions' bubblesheets, "
+        f"{len(submissions) - len(emitted_subs)} skipped -> {batch_dir}"
     )
     return batch_dir
 
 
-def _write_report(path: Path, exams: list[Exam], unassigned: list[ScannedPage]) -> None:
+def _group_by(items, key) -> dict:
+    groups = defaultdict(list)
+    for item in items:
+        groups[key(item)].append(item)
+    return dict(groups)
+
+
+def _write_report(
+    path: Path,
+    exams: list[Exam],
+    unassigned: list[ScannedPage],
+    submissions: list[ExportSubmission] = (),
+) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -1335,6 +1715,22 @@ def _write_report(path: Path, exams: list[Exam], unassigned: list[ScannedPage]) 
         for p in unassigned:
             writer.writerow(
                 ["", "", "", "", "unassigned", p.ref, "", "", "", "", "no serial number"]
+            )
+        for sub in submissions:
+            writer.writerow(
+                [
+                    sub.key,
+                    sub.version or "",
+                    "",
+                    sub.netid,
+                    "skipped" if sub.skipped else "emitted",
+                    "" if sub.page_index is None else f"{sub.file}:{sub.page_index + 1}",
+                    "",
+                    "",
+                    sub.filled.get("name", False),
+                    sub.filled.get("id", False),
+                    "; ".join(([f"SKIPPED: {sub.skipped}"] if sub.skipped else []) + sub.warnings),
+                ]
             )
 
 
