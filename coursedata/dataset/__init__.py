@@ -242,7 +242,7 @@ def process_artifacts_cmd(
     exam_dirs: Annotated[
         Optional[list[Path]],
         typer.Argument(
-            help="Exam directories of scanned PDFs (default: every subdirectory of RAW_DATA_DIR/artifacts)"
+            help="Exam directories of scanned PDFs, or exam names under RAW_DATA_DIR/artifacts (default: all of them)"
         ),
     ] = None,
     dry_run: Annotated[

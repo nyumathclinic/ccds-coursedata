@@ -1744,6 +1744,11 @@ def process_all(
         logger.info(f"No exam directories in {ARTIFACTS_RAW_DIR}; skipping.")
         return
     for raw_dir in exam_dirs:
+        # A bare exam name ("mt1") means RAW_DATA_DIR/artifacts/mt1.
+        if not raw_dir.exists() and (ARTIFACTS_RAW_DIR / raw_dir).is_dir():
+            raw_dir = ARTIFACTS_RAW_DIR / raw_dir
+        if not raw_dir.is_dir():
+            raise FileNotFoundError(f"No exam directory {raw_dir} (or {ARTIFACTS_RAW_DIR / raw_dir})")
         raw_dir = raw_dir.resolve()
         try:
             rel = raw_dir.relative_to(ARTIFACTS_RAW_DIR.resolve())

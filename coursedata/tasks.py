@@ -10,6 +10,7 @@ import time
 from urllib.parse import urlparse
 
 import keyring
+import pandas as pd
 from loguru import logger
 import typer
 
@@ -127,21 +128,30 @@ def _add_sections_to_roster(roster_path: Path, gradebook_path: Path, output_path
     return Path(result)
 
 
-def _find_latest_gradebook(save_dir: Path) -> Optional[Path]:
-    if not save_dir.exists():
-        return None
-    candidates = sorted(save_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0] if candidates else None
+def _emails(csv_path: Path) -> set[str]:
+    try:
+        emails = pd.read_csv(csv_path, usecols=["Email"], dtype=str)["Email"]
+    except (ValueError, OSError, pd.errors.ParserError):
+        return set()
+    return set(emails.dropna().str.strip().str.casefold())
 
 
-def _find_latest_gradebook_anywhere() -> Optional[Path]:
+def _find_fallback_gradebook(roster_path: Path, min_overlap: float = 0.5) -> Optional[Path]:
+    """Newest saved Brightspace gradebook for the same course as a Gradescope roster.
+
+    Gradebook file names carry the course title but not the Brightspace course ID, and
+    several courses share one download directory, so "newest file" can be another
+    course's gradebook. Instead, require that most of the roster's students appear in it.
+    """
     base_dir = RAW_DATA_DIR / "brightspace" / "gradebooks"
-    if not base_dir.exists():
+    roster = _emails(roster_path)
+    if not base_dir.exists() or not roster:
         return None
-    candidates = sorted(
-        base_dir.rglob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True
-    )
-    return candidates[0] if candidates else None
+    candidates = sorted(base_dir.rglob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for candidate in candidates:
+        if len(roster & _emails(candidate)) >= min_overlap * len(roster):
+            return candidate
+    return None
 
 
 @app.command("sync-gradescope-rosters")
@@ -593,22 +603,17 @@ def sync_gradescope_sections(
                 time.sleep(2)
 
         if gradebook_paths is None:
-            fallback = _find_latest_gradebook(raw_gradebooks_dir)
+            fallback = _find_fallback_gradebook(roster_path)
             if fallback:
                 logger.warning(
-                    f"Using most recent gradebook from '{raw_gradebooks_dir}': {fallback.name}"
+                    f"Using most recent gradebook matching this course's roster: {fallback}"
                 )
                 gradebook_paths = [fallback]
             else:
-                fallback_any = _find_latest_gradebook_anywhere()
-                if fallback_any:
-                    logger.warning(
-                        "Using most recent gradebook from earlier run: "
-                        f"{fallback_any}"
-                    )
-                    gradebook_paths = [fallback_any]
-                else:
-                    raise typer.Exit(code=1) from last_error
+                logger.error(
+                    f"No saved Brightspace gradebook matches the roster for course {bs_course}."
+                )
+                raise typer.Exit(code=1) from last_error
         if isinstance(gradebook_paths, list):
             if len(gradebook_paths) != 1:
                 logger.error(
