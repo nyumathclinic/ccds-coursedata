@@ -338,7 +338,7 @@ def build_students(exam: Exam, snap: Snapshot, roster: pd.DataFrame) -> pd.DataF
     """One row per student on the roster or with a submission, with each part's submission."""
     roster = roster.copy()
     roster["key"] = roster["Email"].str.strip().str.casefold()
-    people = roster[["key", "First Name", "Last Name", "SID", "Email", "Section"]].copy()
+    people = roster.reindex(columns=["key", "First Name", "Last Name", "SID", "Email", "Section"])  # single-section courses have no Section column
     people["On Roster"] = True
 
     scores = snap.scores[snap.scores["Email"].notna()].copy()  # see build_unmatched
