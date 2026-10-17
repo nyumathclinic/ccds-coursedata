@@ -15,12 +15,13 @@ carries ArUco markers 0-3 in its corners. Scanner PDFs come in two kinds:
 Runs are incremental. Each run processes only raw PDFs not seen before (by content hash) and
 writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<exam>/<timestamp>/``:
 
-* ``<version>.pdf``: the batch's exams of that version, sorted by serial number, with each exam's
-  pages put in template order. A missing page is replaced by the blank template page; a scanned
+* ``<version>-<timestamp>.pdf``: the batch's exams of that version, sorted by serial number, with
+  each exam's pages put in template order. A missing page is replaced by the blank template page; a scanned
   page that matches no template page is appended after the exam's template pages, unless it is
   totally blank, in which case it is dropped.
-* ``<version>-bubblesheets.pdf``: only the bubblesheet pages, in the same order. A blank Name or
-  ID box is filled with an image of what the student wrote in the matching box on the cover.
+* ``<version>-bubblesheets-<timestamp>.pdf``: only the bubblesheet pages, in the same order. A
+  blank Name or ID box is filled with an image of what the student wrote in the matching box on
+  the cover.
 * ``held/<exam>.pdf``: exams that look like ones emitted in an earlier batch (same serial, or an
   unbarcoded exam of an already-emitted unbarcoded version). Not for upload; resolve by hand.
 * ``report.csv``: one row per exam, recording the page mapping, fills, and any warnings.
@@ -28,12 +29,14 @@ writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<
 Gradescope submission exports (``assignment_<id>_export/`` folders or ``.zip`` files in the exam
 directory, from "Export Submissions" or ``dataset get gradescope submissions``) are exams already
 uploaded and matched to students, e.g. to the free-response part. Only their bubblesheets are
-emitted, into the same ``<version>-bubblesheets.pdf`` files, for the multiple-choice part: a blank
-Name or ID box gets the student's name and NetID (or ``stamp_id = "sid"``) typed in, and
-``bubblesheets.csv`` lists whose bubblesheet is on each page. A submission uploaded from an earlier
-batch's ``<version>.pdf`` is skipped, since that batch already has its bubblesheet.
+emitted, into the same ``<version>-bubblesheets-<timestamp>.pdf`` files, for the multiple-choice
+part: a blank Name or ID box gets the student's name and NetID (or ``stamp_id = "sid"``) typed in,
+and ``bubblesheets.csv`` lists whose bubblesheet is on each page. A submission uploaded from an
+earlier batch's ``<version>-<timestamp>.pdf`` (or ``<version>.pdf``, from before file names were
+stamped) is skipped, since that batch already has its bubblesheet.
 
-Here ``<version>`` is the Aztec text without its extension (``ch6-16A``). The ledgers
+Here ``<version>`` is the Aztec text without its extension (``ch6-16A``), and ``<timestamp>`` is
+the batch folder's name, so file names stay distinct across batches when uploaded. The ledgers
 ``processed_files.csv`` and ``processed_exams.csv`` next to the batch folders record what has been
 processed; ``--forget BATCH`` deletes a batch and its ledger rows so it can be redone.
 """
@@ -1303,14 +1306,23 @@ def resolve_export_versions(
                 sub.warnings.append(f"no readable cover; version {majority}, as for the rest of {export}")
 
 
-def duplicate_reason(sub: ExportSubmission, emitted_versions: dict[str, str]) -> str | None:
+def output_stem(version: str, batch: str, kind: str = "") -> str:
+    """File stem of a batch's output PDF: ``<version>[-<kind>]-<batch>``, e.g. ``ch6-16A-2026-10-17T1513``.
+
+    The batch stamp keeps names distinct across batches, so an upload to Gradescope never
+    looks like (or is refused as) a re-upload of an earlier batch's file.
+    """
+    return "-".join(filter(None, (version, kind, batch)))
+
+
+def duplicate_reason(sub: ExportSubmission, emitted_stems: dict[str, str]) -> str | None:
     """Why a submission's bubblesheet was already produced: it was uploaded from a batch's output.
 
-    ``emitted_versions`` maps versions emitted from scanned PDFs to their (latest) batch.
+    ``emitted_stems`` maps the file stems of exam PDFs emitted from scanned PDFs to their batch.
     """
     stem = Path(sub.original_filename).stem
-    if stem in emitted_versions:
-        return f"uploaded from {sub.original_filename} of batch {emitted_versions[stem]}, which has its bubblesheet"
+    if stem in emitted_stems:
+        return f"uploaded from {sub.original_filename} of batch {emitted_stems[stem]}, which has its bubblesheet"
     return None
 
 
@@ -1466,14 +1478,15 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
         logger.info(f"{raw_dir.name}: no new scanned PDFs or exported submissions")
         return None
 
-    # Versions emitted from scanned PDFs (not exports), for spotting re-exported submissions.
-    emitted_versions = {
-        r["version"]: r["batch"]
-        for r in exams_ledger
-        if r["status"] == "emitted" and not r["key"].startswith("submission:")
-    }
+    # Exam PDFs emitted from scanned PDFs (not exports), by file stem, for spotting re-exported
+    # submissions. Batches before stamped file names wrote "<version>.pdf".
+    emitted_stems: dict[str, str] = {}
+    for r in exams_ledger:
+        if r["status"] == "emitted" and not r["key"].startswith("submission:"):
+            emitted_stems[r["version"]] = r["batch"]
+            emitted_stems[output_stem(r["version"], r["batch"])] = r["batch"]
     for sub in submissions:
-        sub.skipped = duplicate_reason(sub, emitted_versions)
+        sub.skipped = duplicate_reason(sub, emitted_stems)
     active = [sub for sub in submissions if not sub.skipped]
     for sub in active:
         scan_submission(sub)
@@ -1554,7 +1567,7 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
                 bubble_out = _append_exam(exam_doc, exam, sources, template_doc)
                 bubble_doc.insert_pdf(exam_doc, from_page=bubble_out, to_page=bubble_out)
             if version_exams:
-                _save(exam_doc, batch_dir / f"{version}.pdf")
+                _save(exam_doc, batch_dir / f"{output_stem(version, batch)}.pdf")
                 logger.info(f"{version}: {len(version_exams)} exams")
             else:
                 exam_doc.close()
@@ -1581,7 +1594,7 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
                 )
             if version_subs:
                 logger.info(f"{version}: {sum(not s.skipped for s in version_subs)} exported submissions")
-            _save(bubble_doc, batch_dir / f"{version}-bubblesheets.pdf")
+            _save(bubble_doc, batch_dir / f"{output_stem(version, batch, 'bubblesheets')}.pdf")
 
         for exam in (e for e in exams if e.held):
             doc = pymupdf.open()

@@ -425,3 +425,20 @@ def test_duplicate_reason():
     assert "batch b1" in duplicate_reason(sub, {"ch6-21A": "b1"})
     sub.original_filename = "20261015171803575.pdf"
     assert duplicate_reason(sub, {"ch6-21A": "b1"}) is None
+
+
+def test_output_stem():
+    assert artifacts.output_stem("ch6-16A", "2026-10-17T1513") == "ch6-16A-2026-10-17T1513"
+    assert (
+        artifacts.output_stem("ch6-16A", "2026-10-17T1513-2", "bubblesheets")
+        == "ch6-16A-bubblesheets-2026-10-17T1513-2"
+    )
+
+
+def test_duplicate_reason_stamped():
+    sub = _sub("e1", "1", [])
+    stems = {"ch6-21A": "b1", artifacts.output_stem("ch6-21A", "b1"): "b1"}
+    sub.original_filename = "ch6-21A-b1.pdf"
+    assert "batch b1" in duplicate_reason(sub, stems)
+    sub.original_filename = "ch6-21A-bubblesheets-b1.pdf"
+    assert duplicate_reason(sub, stems) is None
