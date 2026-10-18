@@ -92,7 +92,7 @@ ROSTER = pd.DataFrame(
     {
         "First Name": ["A", "B", "C", "D"],
         "Last Name": ["Aa", "Bb", "Cc", "Dd"],
-        "SID": ["1", "2", "3", "4"],
+        "SID": ["N10000001", "N10000002", "N10000003", "N10000004"],
         "Email": ["a@x.edu", "b@x.edu", "c@x.edu", "d@x.edu"],
         "Role": ["Student"] * 4,
         "Section": ["16", "16", "21", "21"],
@@ -217,8 +217,119 @@ def test_render_dashboard_smoke():
     )
     assert "Test 1" in page
     assert "Last refresh failed: Timeout &lt;x&gt;" in page
-    assert "20 minutes old" in page
+    # Staleness is shown by the reader's browser, from the embedded fetch time.
+    assert f'data-fetched="{NOW.isoformat()}"' in page
+    assert 'id="stale" hidden' in page
+    assert 'id="pause"' in page and "http-equiv" not in page
     assert "/assignments/202/submissions/7" in page
+
+
+def _public_page(snap=None, exam=None):
+    exam, snap = exam or _exam(), snap or _snapshot()
+    students = build_students(exam, snap, ROSTER)
+    progress = build_progress(exam, snap)
+    progress = progress.merge(grading_rates(exam, progress, _history([(0, 1)]), NOW), on="problem", how="left")
+    args = (exam, students, progress, build_stats(exam, snap, students), build_unmatched(snap), NOW)
+    return render_dashboard(*args, watch_error="Timeout at /Users/x", public=True), students
+
+
+def test_public_dashboard_identifies_no_student():
+    page, students = _public_page()
+    for column in ("Email", "Last Name", "SID"):
+        for value in students[column].dropna().astype(str):
+            if value not in ("Student",):  # the unmatched placeholder name
+                assert value not in page, (column, value)
+    assert "submissions/7" not in page  # no links to unmatched submissions
+    assert "/Users/x" not in page and "Last refresh failed" in page  # error details stay local
+    # ...but the counts are there.
+    assert "Missing FR" in page and "Not matched to a student: FR B" in page
+    assert "Submitted but not on roster" in page
+    assert "Lists of students are only on the instructor" in page
+    assert "Ann; Cy" in page  # graders are staff, so they are shown
+    assert "No part submitted" in page
+    # Statistics of fewer than PUBLIC_MIN_GROUP graded exams would give away scores.
+    assert "fewer than 5" in page and "Hidden until at least 5 are graded" in page
+    assert ">100.0<" not in page  # the lone fully graded FR exam's score
+
+
+def test_exam_keys_skip_publish(monkeypatch):
+    monkeypatch.setattr(grading, "GRADING_CONFIG", {"t1": {}, "publish": {"host": "h"}})
+    assert grading.exam_keys() == ["t1"]
+
+
+def test_load_publish(monkeypatch):
+    monkeypatch.setattr(grading, "GRADING_CONFIG", {})
+    assert grading.load_publish() is None
+    cfg = {"host": "access.example.edu", "user": "mpl5", "remote_dir": "/web/mpl5/grading/", "viewers": ["mpl5"]}
+    monkeypatch.setattr(grading, "GRADING_CONFIG", {"publish": cfg})
+    target = grading.load_publish()
+    assert target.destination == "mpl5@access.example.edu"
+    assert target.remote_dir == "/web/mpl5/grading"
+    for bad in ({**cfg, "viewers": []}, {**cfg, "viewers": ["a b"]}, {k: v for k, v in cfg.items() if k != "host"}):
+        monkeypatch.setattr(grading, "GRADING_CONFIG", {"publish": bad})
+        with pytest.raises(ValueError):
+            grading.load_publish()
+
+
+def test_htaccess():
+    text = grading.htaccess(["mpl5", "abc123"], 'Test "1" grading')
+    assert "AuthType openid-connect" in text
+    assert "Require claim sub:mpl5\nRequire claim sub:abc123" in text
+    assert 'AuthName "Test 1 grading"' in text
+    with pytest.raises(ValueError):
+        grading.htaccess([], "x")
+
+
+class FakeRun:
+    def __init__(self, returncodes=()):
+        self.calls, self.returncodes = [], list(returncodes)
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(args)
+        code = self.returncodes.pop(0) if self.returncodes else 0
+        if kwargs.get("check") and code:
+            raise RuntimeError(code)
+        return type("Done", (), {"returncode": code})()
+
+
+def test_publish_dashboard_commands(monkeypatch, tmp_path):
+    exam = _exam()
+    monkeypatch.setattr(grading, "PROCESSED_GRADING_DIR", tmp_path)
+    monkeypatch.setattr(grading, "load_exam", lambda key=None: exam)
+    monkeypatch.setattr(
+        grading,
+        "GRADING_CONFIG",
+        {"publish": {"host": "h.edu", "user": "u", "remote_dir": "/web/u/g", "url": "https://h.edu/~u/g",
+                     "viewers": ["u", "v1"]}},
+    )  # fmt: skip
+    with pytest.raises(FileNotFoundError):
+        grading.publish_dashboard(run=FakeRun())
+    public = tmp_path / "t1" / "public"
+    public.mkdir(parents=True)
+    (public / "index.html").write_text("<html></html>")
+    run = FakeRun()
+    assert grading.publish_dashboard(run=run) == "https://h.edu/~u/g/t1/"
+    assert "Require claim sub:v1" in (public / ".htaccess").read_text()
+    ssh, rsync = run.calls
+    assert ssh[0] == "ssh" and "BatchMode=yes" in ssh and "u@h.edu" in ssh
+    assert "mkdir -p /web/u/g/t1" in ssh[-1]
+    assert rsync[0] == "rsync" and "-a" in rsync
+    assert oct(public.stat().st_mode & 0o777) == "0o711"
+    assert oct((public / ".htaccess").stat().st_mode & 0o777) == "0o644"
+    assert "ControlPath=" in rsync[rsync.index("-e") + 1] and "BatchMode=yes" in rsync[rsync.index("-e") + 1]
+    assert rsync[-2:] == [f"{public}/", "u@h.edu:/web/u/g/t1/"]
+
+
+def test_ensure_connection(monkeypatch, tmp_path):
+    monkeypatch.setattr(grading, "CONTROL_DIR", tmp_path / "cm")
+    target = grading.PublishTarget(host="h.edu", remote_dir="/r", viewers=["u"], user="u")
+    run = FakeRun([0])
+    grading.ensure_connection(target, run=run)
+    assert len(run.calls) == 1 and "-O" in run.calls[0]  # already open: only checked
+    run = FakeRun([255, 0])
+    grading.ensure_connection(target, run=run)
+    assert run.calls[1][-4:] == ["-M", "-N", "-f", "u@h.edu"]
+    assert (tmp_path / "cm").is_dir()
 
 
 def test_load_exam(monkeypatch):

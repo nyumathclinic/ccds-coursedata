@@ -434,6 +434,13 @@ def watch_gradescope_grading_cmd(
     open_browser: Annotated[
         bool, typer.Option("--open/--no-open", help="Open the dashboard in a browser")
     ] = True,
+    publish: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--publish/--no-publish",
+            help="Upload the public page after each refresh (default: if publishing is configured)",
+        ),
+    ] = None,
     headless: Annotated[
         bool,
         typer.Option(
@@ -451,10 +458,42 @@ def watch_gradescope_grading_cmd(
         headless=headless,
         keep=keep,
         open_browser=open_browser,
+        publish=publish,
     )
 
 
 app.add_typer(watch_app, name="watch")
+
+
+# ---------------------------------------------------------------------------
+# publish group
+# ---------------------------------------------------------------------------
+
+publish_app = typer.Typer(
+    help="Upload reports to a web host.",
+    no_args_is_help=True,
+)
+
+
+@publish_app.command("gradescope-grading")
+def publish_gradescope_grading_cmd(
+    exam: Annotated[
+        Optional[str],
+        typer.Argument(help="Exam key in [tool.coursedata.gradescope.grading] (optional if only one)"),
+    ] = None,
+) -> None:
+    """Upload the public grading dashboard (no student identifiers), restricted to its viewers' NetIDs."""
+    from .gradescope import grading as _grading
+
+    target = _grading.load_publish()
+    if target is None:
+        logger.error("Publishing is not configured: add [tool.coursedata.gradescope.grading.publish]")
+        raise typer.Exit(code=1)
+    _grading.ensure_connection(target)
+    typer.echo(_grading.publish_dashboard(exam))
+
+
+app.add_typer(publish_app, name="publish")
 
 
 # ---------------------------------------------------------------------------

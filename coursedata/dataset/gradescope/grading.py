@@ -34,9 +34,22 @@ Steps (all keyed by exam, which may be omitted when only one exam is configured)
   ``students.csv``, ``progress.csv`` and ``stats.csv`` to
   ``PROCESSED_DATA_DIR/gradescope/grading/<exam>/`` and append to ``history.csv`` there.
 * ``dataset report gradescope-grading [EXAM]``: write ``dashboard.html`` next to them.
-* ``dataset watch gradescope-grading [EXAM]``: get, process and report in a loop.
+* ``dataset watch gradescope-grading [EXAM]``: get, process and report in a loop, and publish
+  if configured.
+* ``dataset publish gradescope-grading [EXAM]``: upload the public page (see below).
 
-Everything stays under ``data/`` (git-ignored): the dashboard lists students by name.
+Everything stays under ``data/`` (git-ignored): the dashboard lists students by name. The report
+also writes ``public/index.html``, a version with no student identifiers (only counts of missing
+parts), which can be published to a web host over SSH with access limited by NYU NetID::
+
+    [tool.coursedata.gradescope.grading.publish]
+    host = "access.cims.nyu.edu"
+    user = "mpl5"
+    remote_dir = "/web/mpl5/grading"          # each exam goes in <remote_dir>/<exam>/
+    url = "https://cims.nyu.edu/~mpl5/grading"
+    viewers = ["mpl5", "abc123"]              # NetIDs allowed by the generated .htaccess
+
+Uploads share one SSH connection (ControlMaster), so a host that asks for Duo asks only once.
 """
 
 from __future__ import annotations
@@ -47,7 +60,9 @@ import html
 import json
 from pathlib import Path
 import re
+import shlex
 import shutil
+import subprocess
 import time
 from typing import Optional
 import webbrowser
@@ -113,7 +128,7 @@ class Exam:
 
 
 def exam_keys() -> list[str]:
-    return [key for key, value in GRADING_CONFIG.items() if isinstance(value, dict)]
+    return [key for key, value in GRADING_CONFIG.items() if isinstance(value, dict) and key != "publish"]
 
 
 def load_exam(key: Optional[str] = None) -> Exam:
@@ -624,9 +639,23 @@ def _bar(percent: float, label: str) -> str:
     )
 
 
-def _histogram(values: pd.Series, title: str) -> str:
-    """Inline SVG histogram of percent scores in 10-point bins."""
+# On the public page, statistics of fewer graded exams than this are hidden: with one or two,
+# they would give away individual students' scores.
+PUBLIC_MIN_GROUP = 5
+
+
+def _category_label(category: str) -> str:
+    return "No part submitted" if category == "none" else category[:1].upper() + category[1:]
+
+
+def _histogram(values: pd.Series, title: str, min_n: int = 0) -> str:
+    """Inline SVG histogram of percent scores in 10-point bins (hidden if fewer than ``min_n``)."""
     values = values.dropna()
+    if 0 < len(values) < min_n:
+        return (
+            f'<figure class="hist"><figcaption>{_e(title)}</figcaption>'
+            f'<p class="muted">Hidden until at least {min_n} are graded.</p></figure>'
+        )
     bins = [0] * 10
     for v in values:
         bins[min(9, max(0, int(v // 10)))] += 1
@@ -665,7 +694,7 @@ def _histogram(values: pd.Series, title: str) -> str:
 def _table(df: pd.DataFrame, columns: list[str], empty: str) -> str:
     if df.empty:
         return f'<p class="muted">{_e(empty)}</p>'
-    head = "".join(f"<th>{_e(c)}</th>" for c in columns)
+    head = "".join(f'<th scope="col">{_e(c)}</th>' for c in columns)
     body = "".join("<tr>" + "".join(f"<td>{_e(r.get(c))}</td>" for c in columns) + "</tr>" for _, r in df.iterrows())
     return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
@@ -680,11 +709,12 @@ def render_dashboard(
     refresh_seconds: int = 60,
     watch_error: Optional[str] = None,
     now: Optional[datetime] = None,
+    public: bool = False,
 ) -> str:
+    """The dashboard page. ``public`` leaves out everything that identifies a student."""
     now = now or datetime.now().astimezone()
     names = [p.name for p in exam.parts]
     on_roster = students[students["On Roster"]]
-    age_min = (now - fetched_at).total_seconds() / 60
 
     # --- tiles
     tiles = []
@@ -752,29 +782,89 @@ def render_dashboard(
         )
         part_blocks.append(
             f"<details{'' if done else ' open'}><summary>{summary}</summary>"
-            '<div class="scroll"><table class="progress"><thead><tr><th>Problem</th><th>Progress (all versions)</th>'
-            "<th>Rate /h</th><th>ETA</th><th>Status</th><th>Responsible</th><th>Graded by</th></tr></thead>"
+            '<div class="scroll"><table class="progress"><thead><tr>'
+            + "".join(
+                f'<th scope="col">{h}</th>'
+                for h in ("Problem", "Progress (all versions)", "Rate /h", "ETA", "Status", "Responsible", "Graded by")
+            )
+            + "</tr></thead>"
             f"<tbody>{''.join(prog_rows)}</tbody></table></div></details>"
         )
     progress_table = "".join(part_blocks)
 
     # --- stats
     stat_cols = ["scope", "group", "n_submitted", "n_graded", "mean", "sd", "min", "q1", "median", "q3", "max"]
-    stats_table = _table(stats.reindex(columns=stat_cols), stat_cols, "No graded submissions yet.")
+    shown = stats.reindex(columns=stat_cols)
+    min_n = PUBLIC_MIN_GROUP if public else 0
+    if public:
+        small = shown["n_graded"].fillna(0) < PUBLIC_MIN_GROUP
+        shown = shown.astype(object)
+        shown.loc[small, stat_cols[4:]] = None
+        shown.loc[small & (stats["n_graded"].fillna(0) > 0), "mean"] = f"(fewer than {PUBLIC_MIN_GROUP})"
+    stats_table = _table(shown, stat_cols, "No graded submissions yet.")
     hists = []
     for p in names:
         sub = students[(students[f"{p} Status"] == "Graded")]
-        hists.append(_histogram(sub[f"{p} Score"] / sub[f"{p} Max"] * 100, f"{p} (fully graded)"))
-    hists.append(_histogram(on_roster["Total Percent"], "Total (all parts graded)"))
+        hists.append(_histogram(sub[f"{p} Score"] / sub[f"{p} Max"] * 100, f"{p} (fully graded)", min_n))
+    hists.append(_histogram(on_roster["Total Percent"], "Total (all parts graded)", min_n))
 
     # --- missing data
+    if public:
+        missing_sections = [_missing_counts(exam, students, unmatched)]
+    else:
+        missing_sections = _missing_lists(exam, students, unmatched)
+
+    banners = []
+    if watch_error:
+        detail = "" if public else f": {_e(watch_error)}"
+        banners.append(f'<div class="banner critical">■ Last refresh failed{detail}</div>')
+    # The page says how old its data is from the reader's clock, so a copy that has stopped being
+    # updated (e.g. a published one) still shows it.
+    banners.append('<div class="banner warning" id="stale" hidden></div>')
+    deadline = f" · deadline {exam.deadline.strftime('%a %b %-d %H:%M')}" if exam.deadline else ""
+    note = (
+        '<p class="muted small">Lists of students are only on the instructor\'s local dashboard.</p>'
+        if public
+        else ""
+    )
+    return _page(
+        exam, fetched_at, refresh_seconds, deadline, banners, tiles, progress_table, hists, stats_table,
+        missing_sections, note,
+    )  # fmt: skip
+
+
+def _missing_counts(exam: Exam, students: pd.DataFrame, unmatched: pd.DataFrame) -> str:
+    """Counts of missing data, without identifying anyone."""
+    names = [p.name for p in exam.parts]
+    on_roster = students[students["On Roster"]]
+    rows = [
+        (_category_label(category), int(n))
+        for category, n in sorted(on_roster["Completeness"].value_counts().items())
+        if category != "complete"
+    ]
+    for (part, version), n in sorted(unmatched.groupby(["part", "version"]).size().items()):
+        rows.append((f"Not matched to a student: {part} {version}", int(n)))
+    rows.append(("Submitted but not on roster", int((~students["On Roster"]).sum())))
+    dup = pd.concat([students[f"{p} Submissions"] > 1 for p in names], axis=1).any(axis=1)
+    rows.append(("More than one submission for a part", int(dup.sum())))
+    body = "".join(f'<tr><td>{_e(label)}</td><td class="num">{n}</td></tr>' for label, n in rows)
+    return (
+        '<div class="scroll"><table><thead><tr><th scope="col">Category</th><th scope="col">Students</th>'
+        f"</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+def _missing_lists(exam: Exam, students: pd.DataFrame, unmatched: pd.DataFrame) -> list[str]:
+    """The missing-data sections listing students (local dashboard only)."""
+    names = [p.name for p in exam.parts]
+    on_roster = students[students["On Roster"]]
     who = ["Last Name", "First Name", "Email", "Section"]
     part_cols = [c for p in names for c in (f"{p} Version", f"{p} Submission ID")]
     missing_sections = []
     for category in sorted(c for c in on_roster["Completeness"].unique() if c != "complete"):
         rows = on_roster[on_roster["Completeness"] == category]
         missing_sections.append(
-            f"<h3>{_e(category.capitalize())} <span class='count'>{len(rows)}</span></h3>"
+            f"<h3>{_e(_category_label(category))} <span class='count'>{len(rows)}</span></h3>"
             + _table(rows, who + part_cols, "")
         )
     if unmatched.empty:
@@ -792,8 +882,9 @@ def render_dashboard(
             for _, u in unmatched.iterrows()
         )
         unmatched_rows = (
-            '<div class="scroll"><table><thead><tr><th>Part</th><th>Version</th><th>Status</th>'
-            f"<th>Submission</th></tr></thead><tbody>{items}</tbody></table></div>"
+            '<div class="scroll"><table><thead><tr><th scope="col">Part</th><th scope="col">Version</th>'
+            '<th scope="col">Status</th><th scope="col">Submission</th></tr></thead>'
+            f"<tbody>{items}</tbody></table></div>"
         )
     missing_sections.insert(
         0,
@@ -811,23 +902,59 @@ def render_dashboard(
         f"<h3>More than one submission for a part <span class='count'>{len(dup)}</span></h3>"
         + _table(dup, who + [f"{p} Submissions" for p in names] + part_cols, "None.")
     )
+    return missing_sections
 
-    banners = []
-    if watch_error:
-        banners.append(f'<div class="banner critical">■ Last refresh failed: {_e(watch_error)}</div>')
-    if age_min > 15:
-        banners.append(
-            f'<div class="banner warning">! Data is {age_min:.0f} minutes old '
-            f"(fetched {fetched_at.strftime('%a %H:%M')}).</div>"
-        )
-    deadline = f" · deadline {exam.deadline.strftime('%a %b %-d %H:%M')}" if exam.deadline else ""
 
+STALE_MINUTES = 15
+
+# Reloads the page every data-refresh seconds unless paused (WCAG 2.2.1), and shows how old the
+# data is by the reader's clock.
+_PAGE_SCRIPT = """
+(function () {
+  var body = document.body, button = document.getElementById('pause');
+  var every = Number(body.dataset.refresh) * 1000, fetched = new Date(body.dataset.fetched);
+  var paused = false, timer = null;
+  try { paused = localStorage.getItem('grading-paused') === '1'; } catch (e) {}
+  function schedule() {
+    clearTimeout(timer);
+    button.setAttribute('aria-pressed', paused ? 'true' : 'false');
+    button.textContent = paused ? 'Resume auto-refresh' : 'Pause auto-refresh';
+    if (!paused) timer = setTimeout(function () { location.reload(); }, every);
+  }
+  button.addEventListener('click', function () {
+    paused = !paused;
+    try { localStorage.setItem('grading-paused', paused ? '1' : '0'); } catch (e) {}
+    schedule();
+  });
+  var minutes = Math.round((Date.now() - fetched.getTime()) / 60000);
+  if (minutes > STALE) {
+    var stale = document.getElementById('stale');
+    stale.textContent = '! Data is ' + minutes + ' minutes old (fetched ' + fetched.toLocaleString() + ').';
+    stale.hidden = false;
+  }
+  schedule();
+})();
+""".replace("STALE", str(STALE_MINUTES))
+
+
+def _page(
+    exam: Exam,
+    fetched_at: datetime,
+    refresh_seconds: int,
+    deadline: str,
+    banners: list[str],
+    tiles: list[str],
+    progress_table: str,
+    hists: list[str],
+    stats_table: str,
+    missing_sections: list[str],
+    note: str,
+) -> str:
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="{int(refresh_seconds)}">
 <title>{_e(exam.title)} Grading</title>
 <style>
 :root {{
@@ -889,12 +1016,17 @@ summary {{ cursor: pointer; font-weight: 600; padding: 6px 0; }}
 .hist g:hover .mark {{ fill: var(--accent-dark); }}
 .hist .axis {{ stroke: var(--line); }}
 .hist .tick {{ fill: var(--muted); font-size: 10px; }}
+header .controls {{ margin-top: 8px; }}
+header button {{ font: inherit; font-size: .85em; color: #fff; background: transparent; border: 1px solid #fff;
+  border-radius: 6px; padding: 3px 10px; cursor: pointer; }}
+header button:focus-visible {{ outline: 2px solid #fff; outline-offset: 2px; }}
 </style>
 </head>
-<body>
+<body data-refresh="{int(refresh_seconds)}" data-fetched="{fetched_at.isoformat()}">
 <header>
   <h1>{_e(exam.title)} — grading</h1>
   <p>Gradescope data fetched {fetched_at.strftime('%a %b %-d %H:%M')} · page refreshes every {int(refresh_seconds)} s{deadline}</p>
+  <div class="controls"><button type="button" id="pause" aria-pressed="false">Pause auto-refresh</button></div>
 </header>
 <main>
 {''.join(banners)}
@@ -911,8 +1043,10 @@ Rate is graded per hour over the last {int(RATE_WINDOW.total_seconds() // 60)} m
 {stats_table}
 
 <h2>Missing data</h2>
+{note}
 {''.join(missing_sections)}
 </main>
+<script>{_PAGE_SCRIPT}</script>
 </body>
 </html>
 """
@@ -953,20 +1087,140 @@ def _report_impl(exam_key: Optional[str] = None, refresh_seconds: int = 60) -> P
     status_path = _watch_status_path(exam)
     if status_path.exists():
         watch_error = json.loads(status_path.read_text()).get("last_error")
-    page = render_dashboard(
-        exam,
-        students,
-        progress,
-        stats,
-        unmatched,
-        datetime.fromisoformat(meta["fetched_at"]),
-        refresh_seconds=refresh_seconds,
-        watch_error=watch_error,
-    )
+    fetched_at = datetime.fromisoformat(meta["fetched_at"])
+    args = (exam, students, progress, stats, unmatched, fetched_at)
     path = out / "dashboard.html"
-    path.write_text(page, encoding="utf-8")
-    logger.success(f"Wrote grading dashboard {path}")
+    path.write_text(
+        render_dashboard(*args, refresh_seconds=refresh_seconds, watch_error=watch_error), encoding="utf-8"
+    )
+    public = out / "public" / "index.html"
+    public.parent.mkdir(exist_ok=True)
+    public.write_text(
+        render_dashboard(*args, refresh_seconds=refresh_seconds, watch_error=watch_error, public=True),
+        encoding="utf-8",
+    )
+    logger.success(f"Wrote grading dashboard {path} (and its public version {public})")
     return path
+
+
+# ---------------------------------------------------------------------------
+# publish
+# ---------------------------------------------------------------------------
+
+# One SSH connection shared by every upload, so a host that asks for Duo asks only once.
+CONTROL_DIR = Path("~/.ssh/controlmasters").expanduser()
+SSH_OPTIONS = [
+    "-o", "ControlMaster=auto",
+    "-o", f"ControlPath={CONTROL_DIR}/%r@%h:%p",
+    "-o", "ControlPersist=12h",
+]  # fmt: skip
+
+
+@dataclass
+class PublishTarget:
+    host: str
+    remote_dir: str
+    viewers: list[str]
+    user: Optional[str] = None
+    url: Optional[str] = None
+
+    @property
+    def destination(self) -> str:
+        return f"{self.user}@{self.host}" if self.user else self.host
+
+
+def load_publish() -> Optional[PublishTarget]:
+    """The [tool.coursedata.gradescope.grading.publish] settings, or None if there are none.
+
+    Raises:
+        ValueError: If they are incomplete. ``viewers`` must name at least one NetID, so the
+            page is never published without access control.
+    """
+    cfg = GRADING_CONFIG.get("publish")
+    if not cfg:
+        return None
+    where = "[tool.coursedata.gradescope.grading.publish]"
+    for name in ("host", "remote_dir"):
+        if not cfg.get(name):
+            raise ValueError(f"Missing '{name}' in {where}")
+    viewers = [str(v).strip() for v in cfg.get("viewers") or [] if str(v).strip()]
+    if not viewers:
+        raise ValueError(f"{where} needs 'viewers', the NetIDs allowed to see the page")
+    bad = [v for v in viewers if not re.fullmatch(r"[A-Za-z0-9]+", v)]
+    if bad:
+        raise ValueError(f"Not NetIDs in {where} viewers: {bad}")
+    return PublishTarget(
+        host=str(cfg["host"]),
+        remote_dir=str(cfg["remote_dir"]).rstrip("/"),
+        viewers=viewers,
+        user=cfg.get("user"),
+        url=str(cfg["url"]).rstrip("/") if cfg.get("url") else None,
+    )
+
+
+def htaccess(viewers: list[str], title: str) -> str:
+    """An .htaccess allowing only ``viewers`` (NetIDs), signed in with NYU single sign-on."""
+    if not viewers:
+        raise ValueError("No viewers: refusing to publish without access control")
+    lines = [
+        "# Written by coursedata (gradescope.grading publish); changes are overwritten.",
+        "AuthType openid-connect",
+        f'AuthName "{title.replace(chr(34), "")}"',
+        *(f"Require claim sub:{netid}" for netid in viewers),
+        "Options -Indexes",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def ensure_connection(target: PublishTarget, run=subprocess.run) -> None:
+    """Open the shared SSH connection to the host if it isn't open (asking for Duo, if needed)."""
+    CONTROL_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    check = run(["ssh", *SSH_OPTIONS, "-O", "check", target.destination], capture_output=True)
+    if check.returncode == 0:
+        return
+    logger.info(f"Opening an SSH connection to {target.destination}; approve Duo if asked")
+    run(["ssh", *SSH_OPTIONS, "-M", "-N", "-f", target.destination], check=True)
+
+
+def publish_dashboard(exam_key: Optional[str] = None, run=subprocess.run) -> str:
+    """Upload an exam's public dashboard and its .htaccess; return its URL (or remote path).
+
+    Uses the shared SSH connection in batch mode, so it fails instead of prompting if the
+    connection is gone; ``ensure_connection`` opens it.
+    """
+    exam = load_exam(exam_key)
+    target = load_publish()
+    if target is None:
+        raise ValueError("Publishing is not configured: add [tool.coursedata.gradescope.grading.publish]")
+    public_dir = exam.processed_dir / "public"
+    if not (public_dir / "index.html").exists():
+        raise FileNotFoundError(f"No {public_dir / 'index.html'}; run `dataset report gradescope-grading`")
+    (public_dir / ".htaccess").write_text(htaccess(target.viewers, f"{exam.title} grading"))
+    # The web server needs these; rsync -a copies them. (macOS's openrsync has no --chmod.)
+    public_dir.chmod(0o711)
+    for path in public_dir.iterdir():
+        path.chmod(0o711 if path.is_dir() else 0o644)
+
+    remote = f"{target.remote_dir}/{exam.key}"
+    batch = ["-o", "BatchMode=yes"]
+    run(
+        [
+            "ssh", *SSH_OPTIONS, *batch, target.destination,
+            f"mkdir -p {shlex.quote(remote)} && chmod 711 {shlex.quote(target.remote_dir)} {shlex.quote(remote)}",
+        ],
+        check=True,
+    )  # fmt: skip
+    run(
+        [
+            "rsync", "-a",
+            "-e", shlex.join(["ssh", *SSH_OPTIONS, *batch]),
+            f"{public_dir}/", f"{target.destination}:{remote}/",
+        ],
+        check=True,
+    )  # fmt: skip
+    where = f"{target.url}/{exam.key}/" if target.url else f"{target.destination}:{remote}/"
+    logger.success(f"Published the '{exam.title}' dashboard to {where}")
+    return where
 
 
 # ---------------------------------------------------------------------------
@@ -988,13 +1242,24 @@ def _watch_impl(
     headless: bool = True,
     keep: int = 20,
     open_browser: bool = True,
+    publish: Optional[bool] = None,
 ) -> None:
-    """Get, process and report every ``every`` seconds until interrupted."""
+    """Get, process and report (and publish) every ``every`` seconds until interrupted.
+
+    ``publish`` defaults to whether publishing is configured.
+    """
     exam = load_exam(exam_key)
     exam.processed_dir.mkdir(parents=True, exist_ok=True)
     status_path = _watch_status_path(exam)
     refresh = max(15, min(60, every))
     opened = False
+    target = load_publish()
+    if publish is None:
+        publish = target is not None
+    if publish:
+        if target is None:
+            raise ValueError("Publishing is not configured: add [tool.coursedata.gradescope.grading.publish]")
+        ensure_connection(target)  # the one Duo approval, before the loop
     logger.info(f"Watching grading of '{exam.title}' every {every} s; Ctrl-C to stop")
     try:
         while True:
@@ -1014,6 +1279,13 @@ def _watch_impl(
                     opened = True
             except Exception as exc:
                 logger.exception(f"Processing grading data failed: {exc}")
+            if publish:
+                try:
+                    publish_dashboard(exam.key)
+                except Exception as exc:  # the published page shows its own age
+                    logger.exception(f"Publishing failed: {exc}")
+                    status["last_error"] = f"Publishing failed: {exc}".splitlines()[0][:300]
+                    status_path.write_text(json.dumps(status))
             prune_snapshots(exam, keep)
             elapsed = time.monotonic() - started
             time.sleep(max(0.0, every - elapsed))
