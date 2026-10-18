@@ -47,7 +47,7 @@ parts), which can be published to a web host over SSH with access limited by NYU
     user = "mpl5"
     remote_dir = "/web/mpl5/grading"          # each exam goes in <remote_dir>/<exam>/
     url = "https://cims.nyu.edu/~mpl5/grading"
-    viewers = ["mpl5", "abc123"]              # NetIDs allowed by the generated .htaccess
+    viewers = ["mpl5", "abc123"]              # NetIDs allowed by the generated .htaccess (uid claim)
 
 Uploads share one SSH connection (ControlMaster), so a host that asks for Duo asks only once.
 """
@@ -1166,7 +1166,9 @@ def htaccess(viewers: list[str], title: str) -> str:
         "# Written by coursedata (gradescope.grading publish); changes are overwritten.",
         "AuthType openid-connect",
         f'AuthName "{title.replace(chr(34), "")}"',
-        *(f"Require claim sub:{netid}" for netid in viewers),
+        # CIMS's docs say `claim sub:`, but NYU's Microsoft sign-in sends an opaque `sub`; the
+        # NetID is the `uid` claim.
+        *(f"Require claim uid:{netid}" for netid in viewers),
         "Options -Indexes",
     ]
     return "\n".join(lines) + "\n"

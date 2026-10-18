@@ -274,7 +274,7 @@ def test_load_publish(monkeypatch):
 def test_htaccess():
     text = grading.htaccess(["mpl5", "abc123"], 'Test "1" grading')
     assert "AuthType openid-connect" in text
-    assert "Require claim sub:mpl5\nRequire claim sub:abc123" in text
+    assert "Require claim uid:mpl5\nRequire claim uid:abc123" in text
     assert 'AuthName "Test 1 grading"' in text
     with pytest.raises(ValueError):
         grading.htaccess([], "x")
@@ -309,7 +309,7 @@ def test_publish_dashboard_commands(monkeypatch, tmp_path):
     (public / "index.html").write_text("<html></html>")
     run = FakeRun()
     assert grading.publish_dashboard(run=run) == "https://h.edu/~u/g/t1/"
-    assert "Require claim sub:v1" in (public / ".htaccess").read_text()
+    assert "Require claim uid:v1" in (public / ".htaccess").read_text()
     ssh, rsync = run.calls
     assert ssh[0] == "ssh" and "BatchMode=yes" in ssh and "u@h.edu" in ssh
     assert "mkdir -p /web/u/g/t1" in ssh[-1]
