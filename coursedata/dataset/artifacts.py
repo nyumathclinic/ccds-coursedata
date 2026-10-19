@@ -22,8 +22,9 @@ writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<
 * ``<version>-bubblesheets-<timestamp>.pdf``: only the bubblesheet pages, in the same order. A
   blank Name or ID box is filled with an image of what the student wrote in the matching box on
   the cover.
-* ``held/<exam>.pdf``: exams that look like ones emitted in an earlier batch (same serial, or an
-  unbarcoded exam of an already-emitted unbarcoded version). Not for upload; resolve by hand.
+* ``held/<exam>.pdf``: exams that look like ones emitted in an earlier batch (same serial, or
+  same personalized student). Not for upload; resolve by hand. An unbarcoded exam of a version
+  already emitted for another unbarcoded exam is emitted, with a possible-rescan warning.
 * ``report.csv``: one row per exam, recording the page mapping, fills, and any warnings.
 
 Gradescope submission exports (``assignment_<id>_export/`` folders or ``.zip`` files in the exam
@@ -1136,13 +1137,12 @@ def personalize(exam: Exam, rows: list[dict[str, str]], existing: set[str]) -> N
         )
 
 
-def hold_reason(
-    exam: Exam, emitted: dict[str, str], unbarcoded_forms: dict[str, str]
-) -> str | None:
+def hold_reason(exam: Exam, emitted: dict[str, str]) -> str | None:
     """Why ``exam`` should be held back from upload, or None.
 
-    ``emitted`` maps exam keys already emitted to their batch; ``unbarcoded_forms`` maps cover
-    versions (forms) already emitted for unbarcoded exams to their batch.
+    ``emitted`` maps exam keys already emitted to their batch. An unbarcoded, unpersonalized
+    exam's key is its file hash, so a rescan of one isn't caught here; several students may
+    take the same version, so its version alone is no reason to hold it (see ``rescan_warning``).
     """
     if exam.key in emitted:
         return f"already emitted in batch {emitted[exam.key]}"
@@ -1150,12 +1150,21 @@ def hold_reason(
         covers = sum(p.aztec is not None for p in exam.pages)
         if covers > 1:
             return f"{covers} covers in one unbarcoded file; split it by hand"
-        if exam.form in unbarcoded_forms:
-            return (
-                f"version {exam.form} already emitted in batch "
-                f"{unbarcoded_forms[exam.form]} (rescan?)"
-            )
     return None
+
+
+def rescan_warning(exam: Exam, unbarcoded_forms: dict[str, str]) -> str | None:
+    """A warning if ``exam`` is unbarcoded and its version was already emitted for one.
+
+    ``unbarcoded_forms`` maps cover versions (forms) already emitted for unbarcoded exams to
+    their batch. Usually another student took the same version, but it may be a rescan.
+    """
+    if exam.barcoded or exam.form not in unbarcoded_forms:
+        return None
+    return (
+        f"version {exam.form} also emitted for an unbarcoded exam in batch "
+        f"{unbarcoded_forms[exam.form]}; check this isn't a rescan"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1548,11 +1557,13 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
     try:
         for exam in sorted(exams, key=lambda e: e.sort_key):
             exam.match(templates, sources)
-            exam.held = hold_reason(exam, emitted, unbarcoded_forms)
+            exam.held = hold_reason(exam, emitted)
             if exam.held:
                 exam.warnings.append(f"HELD: {exam.held}")
             elif not exam.barcoded:
-                unbarcoded_forms[exam.form] = batch
+                if warning := rescan_warning(exam, unbarcoded_forms):
+                    exam.warnings.append(warning)
+                unbarcoded_forms.setdefault(exam.form, batch)
 
         by_version: dict[str, list[Exam]] = defaultdict(list)
         for exam in exams:

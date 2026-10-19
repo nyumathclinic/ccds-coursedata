@@ -16,6 +16,7 @@ from coursedata.dataset.artifacts import (
     is_exam_serial,
     personalize,
     read_ledger,
+    rescan_warning,
     serial_sort_key,
     split_code39,
     version_label,
@@ -148,19 +149,22 @@ def test_group_exams_by_serial_across_files_and_unbarcoded_file():
 
 def test_hold_reason():
     barcoded = Exam(key="serial:1", label="1", pages=[_page("s.pdf", 0, "1", "v.qns")])
-    assert hold_reason(barcoded, {}, {}) is None
-    assert "batch B1" in hold_reason(barcoded, {"serial:1": "B1"}, {})
+    assert hold_reason(barcoded, {}) is None
+    assert "batch B1" in hold_reason(barcoded, {"serial:1": "B1"})
 
     moses = Exam(key="file:abc", label="m.pdf", pages=[_page("m.pdf", 0, aztec="w.qns")])
-    assert hold_reason(moses, {}, {}) is None
-    assert "rescan" in hold_reason(moses, {}, {"w": "B1"})
+    # Another unbarcoded exam of the same version is emitted, with a warning.
+    assert hold_reason(moses, {}) is None
+    assert rescan_warning(moses, {}) is None
+    assert "rescan" in rescan_warning(moses, {"w": "B1"})
+    assert rescan_warning(barcoded, {"v": "B1"}) is None
 
     two_covers = Exam(
         key="file:def",
         label="x.pdf",
         pages=[_page("x.pdf", 0, aztec="w.qns"), _page("x.pdf", 1, aztec="w.qns")],
     )
-    assert "split it by hand" in hold_reason(two_covers, {}, {})
+    assert "split it by hand" in hold_reason(two_covers, {})
 
 
 def test_forget_batch(tmp_path):
@@ -213,7 +217,7 @@ def test_personalize_sets_key_and_version():
     assert exam.key == "netid:ch6:alt9145"
     assert (exam.netid, exam.form, exam.version) == ("alt9145", "ch6-alt9145", "ch6-21A")
     # A rescan of the same student's exam is held by its key.
-    assert "already emitted" in hold_reason(exam, {"netid:ch6:alt9145": "B1"}, {})
+    assert "already emitted" in hold_reason(exam, {"netid:ch6:alt9145": "B1"})
 
 
 # ---------------------------------------------------------------------------
