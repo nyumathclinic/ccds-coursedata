@@ -10,7 +10,8 @@ carries ArUco markers 0-3 in its corners. Scanner PDFs come in two kinds:
 
 * barcoded stacks of concatenated exams, where every page carries a Code39 serial number (the
   last character is a mod-43 check character) identifying its exam;
-* unbarcoded PDFs (e.g. from the testing center), each holding exactly one exam.
+* unbarcoded PDFs (e.g. from the testing center), each holding one exam, or several back to
+  back, each starting at its cover.
 
 Runs are incremental. Each run processes only raw PDFs not seen before (by content hash) and
 writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<exam>/<timestamp>/``:
@@ -1076,7 +1077,10 @@ def group_exams(
 
     In a file where some page carries an exam serial, pages are grouped by serial (across all
     files, so an exam split between files is reassembled); pages without one are unassigned. A
-    file where no page carries a serial is a single unbarcoded exam.
+    file where no page carries a serial holds unbarcoded exams, one starting at each cover
+    (pages before the first cover belong to the first exam). A file of one exam is keyed by its
+    hash and labeled by its name; the n-th of several is keyed ``<hash>:<n>`` and labeled
+    ``<stem>-<n><suffix>``.
     """
     by_serial: dict[str, list[ScannedPage]] = defaultdict(list)
     exams, unassigned = [], []
@@ -1084,8 +1088,20 @@ def group_exams(
         if any(p.serial for p in pages):
             for p in pages:
                 (by_serial[p.serial] if p.serial else unassigned).append(p)
+            continue
+        groups: list[list[ScannedPage]] = [[]]
+        for p in pages:
+            if p.aztec is not None and any(q.aztec is not None for q in groups[-1]):
+                groups.append([])
+            groups[-1].append(p)
+        key = f"file:{hashes[path][:16]}"
+        if len(groups) == 1:
+            exams.append(Exam(key=key, label=path.name, pages=groups[0]))
         else:
-            exams.append(Exam(key=f"file:{hashes[path][:16]}", label=path.name, pages=pages))
+            exams += [
+                Exam(key=f"{key}:{n}", label=f"{path.stem}-{n}{path.suffix}", pages=group)
+                for n, group in enumerate(groups, 1)
+            ]
     exams += [Exam(key=f"serial:{s}", label=s, pages=ps) for s, ps in by_serial.items()]
     return exams, unassigned
 
@@ -1146,10 +1162,6 @@ def hold_reason(exam: Exam, emitted: dict[str, str]) -> str | None:
     """
     if exam.key in emitted:
         return f"already emitted in batch {emitted[exam.key]}"
-    if not exam.barcoded:
-        covers = sum(p.aztec is not None for p in exam.pages)
-        if covers > 1:
-            return f"{covers} covers in one unbarcoded file; split it by hand"
     return None
 
 
@@ -1560,10 +1572,10 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
             exam.held = hold_reason(exam, emitted)
             if exam.held:
                 exam.warnings.append(f"HELD: {exam.held}")
-            elif not exam.barcoded:
-                if warning := rescan_warning(exam, unbarcoded_forms):
-                    exam.warnings.append(warning)
-                unbarcoded_forms.setdefault(exam.form, batch)
+            # Only against earlier batches: exams of one version in this batch, e.g. several
+            # makeups in one file, are different students, and identical files are skipped by hash.
+            elif warning := rescan_warning(exam, unbarcoded_forms):
+                exam.warnings.append(warning)
 
         by_version: dict[str, list[Exam]] = defaultdict(list)
         for exam in exams:

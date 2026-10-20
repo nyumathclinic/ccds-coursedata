@@ -144,7 +144,28 @@ def test_group_exams_by_serial_across_files_and_unbarcoded_file():
     assert set(by_key) == {"serial:1", "file:" + "c" * 16}
     assert len(by_key["serial:1"].pages) == 3
     assert by_key["file:" + "c" * 16].label == "m.pdf"
+    assert by_key["file:" + "c" * 16].pages == moses
     assert unassigned == [stack1[2]]
+
+
+def test_group_exams_splits_unbarcoded_file_at_covers():
+    # A leading page without a cover, then two exams back to back.
+    pages = [
+        _page("x.pdf", 0),
+        _page("x.pdf", 1, aztec="w.qns"),
+        _page("x.pdf", 2),
+        _page("x.pdf", 3, aztec="w.qns"),
+        _page("x.pdf", 4),
+    ]
+    exams, unassigned = group_exams({Path("x.pdf"): pages}, {Path("x.pdf"): "d" * 64})
+    assert unassigned == []
+    assert [(e.key, e.label) for e in exams] == [
+        ("file:" + "d" * 16 + ":1", "x-1.pdf"),
+        ("file:" + "d" * 16 + ":2", "x-2.pdf"),
+    ]
+    assert exams[0].pages == pages[:3]
+    assert exams[1].pages == pages[3:]
+    assert all(hold_reason(e, {}) is None for e in exams)
 
 
 def test_hold_reason():
@@ -158,13 +179,6 @@ def test_hold_reason():
     assert rescan_warning(moses, {}) is None
     assert "rescan" in rescan_warning(moses, {"w": "B1"})
     assert rescan_warning(barcoded, {"v": "B1"}) is None
-
-    two_covers = Exam(
-        key="file:def",
-        label="x.pdf",
-        pages=[_page("x.pdf", 0, aztec="w.qns"), _page("x.pdf", 1, aztec="w.qns")],
-    )
-    assert "split it by hand" in hold_reason(two_covers, {})
 
 
 def test_forget_batch(tmp_path):
