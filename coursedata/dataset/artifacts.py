@@ -1482,7 +1482,7 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
     seen = {r["sha256"]: r["batch"] for r in files_ledger}
 
     hashes: dict[Path, str] = {}
-    for path in sorted(raw_dir.glob("*.pdf")):
+    for path in sorted(raw_dir.glob("*.pdf", case_sensitive=False)):  # scanners may write .PDF
         sha = file_sha256(path)
         if sha in seen:
             logger.debug(f"{path.name}: already processed in batch {seen[sha]}")
