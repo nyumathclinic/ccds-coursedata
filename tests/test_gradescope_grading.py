@@ -361,6 +361,47 @@ def test_load_exam(monkeypatch):
         grading.load_exam("nope")
 
 
+def test_load_exam_homework(monkeypatch):
+    monkeypatch.setattr(
+        grading,
+        "GRADING_CONFIG",
+        {
+            "t1": {
+                "course": "1",
+                "roster": "r.csv",
+                "parts": [{"name": "MC", "containers": ["10"]}],
+                "homework": {
+                    "Q4": {"assignment": 500, "question": 5},
+                    "Q22": [{"assignment": "600", "question": "4"}, {"assignment": "700", "question": "6", "course": "2"}],
+                },
+            }
+        },
+    )
+    exam = grading.load_exam()
+    assert exam.homework == {
+        "Q4": [grading.HomeworkProblem("1", "500", "5")],
+        "Q22": [grading.HomeworkProblem("1", "600", "4"), grading.HomeworkProblem("2", "700", "6")],
+    }
+    assert grading.load_exam().homework["Q4"][0].assignment == "500"
+
+
+def test_load_exam_homework_requires_question(monkeypatch):
+    monkeypatch.setattr(
+        grading,
+        "GRADING_CONFIG",
+        {
+            "t1": {
+                "course": "1",
+                "roster": "r.csv",
+                "parts": [{"name": "MC", "containers": ["10"]}],
+                "homework": {"Q4": {"assignment": "500"}},
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="question"):
+        grading.load_exam()
+
+
 def test_load_exam_requires_parts(monkeypatch):
     monkeypatch.setattr(grading, "GRADING_CONFIG", {"t1": {"course": "1", "roster": "r.csv"}})
     with pytest.raises(ValueError, match="parts"):

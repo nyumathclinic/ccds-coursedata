@@ -23,13 +23,21 @@ free response), each made of one or more Gradescope assignment containers (versi
     "FR.1" = ["Alice", "Bob"]
     "FR" = ["Carol"]
 
+    # optional: homework problems practicing the same skill as an exam question, keyed by the
+    # exam's printed question number (as in the exam analysis notebook)
+    [tool.coursedata.gradescope.grading.ch5-6.homework]
+    Q4 = { assignment = "8551251", question = "5" }      # Problem Set 1, Problem 5
+    Q22 = [{ assignment = "8690616", question = "4" }, { assignment = "8690616", question = "6" }]
+
 Questions are matched across versions by outline number (``FR.1`` is question 1 of every FR
 version), unless a version's ``question_map`` renumbers them.
 
 Steps (all keyed by exam, which may be omitted when only one exam is configured):
 
 * ``dataset get gradescope grading [EXAM]``: one Gradescope session that reads every version's
-  Grading Dashboard and scores CSV into ``RAW_DATA_DIR/gradescope/grading/<exam>/<timestamp>/``.
+  Grading Dashboard and scores CSV into ``RAW_DATA_DIR/gradescope/grading/<exam>/<timestamp>/``,
+  plus the scores CSV of each ``homework`` assignment into ``<course>/homework/<assignment>_scores.csv``
+  there (``--no-homework`` skips them; ``watch`` always does).
 * ``dataset process gradescope-grading [EXAM]``: from the newest snapshot, write
   ``students.csv``, ``progress.csv`` and ``stats.csv`` to
   ``PROCESSED_DATA_DIR/gradescope/grading/<exam>/`` and append to ``history.csv`` there.
@@ -105,6 +113,13 @@ class Part:
     question_map: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class HomeworkProblem:
+    course: str
+    assignment: str
+    question: str  # outline number in the assignment's scores CSV ("5" for "5: Problem 5 ...")
+
+
 @dataclass
 class Exam:
     key: str
@@ -113,6 +128,7 @@ class Exam:
     parts: list[Part]
     graders: dict[str, list[str]]
     deadline: Optional[datetime] = None
+    homework: dict[str, list[HomeworkProblem]] = field(default_factory=dict)
 
     @property
     def raw_dir(self) -> Path:
@@ -179,6 +195,16 @@ def load_exam(key: Optional[str] = None) -> Exam:
     graders = {
         str(k): [v] if isinstance(v, str) else [str(x) for x in v] for k, v in (cfg.get("graders") or {}).items()
     }
+    homework = {}
+    for item, problems in (cfg.get("homework") or {}).items():
+        homework[str(item)] = [
+            HomeworkProblem(
+                str(p.get("course") or cfg.get("course") or parts[0].course),
+                str(require(p, "assignment", f"{where} homework.{item}")),
+                str(require(p, "question", f"{where} homework.{item}")),
+            )
+            for p in ([problems] if isinstance(problems, dict) else problems)
+        ]
     return Exam(
         key=key,
         title=str(cfg.get("title") or key),
@@ -186,6 +212,7 @@ def load_exam(key: Optional[str] = None) -> Exam:
         parts=parts,
         graders=graders,
         deadline=deadline,
+        homework=homework,
     )
 
 
@@ -194,7 +221,9 @@ def load_exam(key: Optional[str] = None) -> Exam:
 # ---------------------------------------------------------------------------
 
 
-def _get_impl(exam_key: Optional[str] = None, headless: bool = True, scores: bool = True) -> Path:
+def _get_impl(
+    exam_key: Optional[str] = None, headless: bool = True, scores: bool = True, homework: bool = True
+) -> Path:
     """Save a snapshot of the exam's grading from Gradescope; return the snapshot directory."""
     from edubag.gradescope.client import GradescopeClient
 
@@ -220,11 +249,20 @@ def _get_impl(exam_key: Optional[str] = None, headless: bool = True, scores: boo
             username=username,
             password=password,
         )
+    if homework:
+        for course, assignment in sorted({(p.course, p.assignment) for ps in exam.homework.values() for p in ps}):
+            save_dir = snapshot_dir / course / "homework"
+            (path,) = client.save_assignment_scores(course, assignment, save_dir=save_dir, headless=headless)
+            path.rename(homework_scores_path(snapshot_dir, course, assignment))
     (snapshot_dir / SNAPSHOT_MARKER).write_text(
         json.dumps({"exam": exam.key, "started": started.isoformat(timespec="seconds"), "scores": scores})
     )
     logger.success(f"Saved grading snapshot of '{exam.title}' to {snapshot_dir}")
     return snapshot_dir
+
+
+def homework_scores_path(snapshot_dir: Path, course: str, assignment: str) -> Path:
+    return snapshot_dir / course / "homework" / f"{assignment}_scores.csv"
 
 
 def snapshots(exam: Exam) -> list[Path]:
@@ -1268,7 +1306,7 @@ def _watch_impl(
             started = time.monotonic()
             status = {"last_attempt": datetime.now().astimezone().isoformat(timespec="seconds"), "last_error": None}
             try:
-                _get_impl(exam.key, headless=headless)
+                _get_impl(exam.key, headless=headless, homework=False)
             except Exception as exc:  # keep watching; the page shows the last good data
                 logger.exception(f"Fetching from Gradescope failed: {exc}")
                 status["last_error"] = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]

@@ -164,12 +164,15 @@ def grading_cmd(
     scores: Annotated[
         bool, typer.Option("--scores/--no-scores", help="Also download each version's scores CSV")
     ] = True,
+    homework: Annotated[
+        bool, typer.Option("--homework/--no-homework", help="Also download the exam's homework scores CSVs")
+    ] = True,
 ) -> None:
     """Snapshot an exam's grading progress and scores from Gradescope (all parts and versions)."""
     from .grading import _get_impl
 
     headless = (ctx.obj or {}).get("headless", False)
-    _get_impl(exam, headless=headless, scores=scores)
+    _get_impl(exam, headless=headless, scores=scores, homework=homework)
 
 
 @app.command("submissions")
