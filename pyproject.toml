@@ -29,6 +29,7 @@ dependencies = [
     "python-dotenv",
     "ruff",
     "scikit-learn",
+    "tqdm",
     "keyring",
     "reportlab",
     # Scanned exam processing (coursedata.dataset.artifacts)
