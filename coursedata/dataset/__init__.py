@@ -529,6 +529,7 @@ def daily(
         "get.albert": lambda: _albert.run_all(headless=headless),
         "get.albert-photo-rosters": lambda: _albert._photo_rosters_impl(headless=headless),
         "get.brightspace": lambda: _brightspace.run_all(headless=headless),
+        "get.brightspace-quizzes": lambda: _brightspace._quizzes_impl(due=True, headless=headless),
         "get.drive": lambda: _drive.run_all(headless=headless),
         "get.gradescope": lambda: _gradescope.run_all(headless=headless),
         "get.edstem": lambda: _edstem.run_all(headless=headless),
