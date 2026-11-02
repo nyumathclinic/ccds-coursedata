@@ -303,11 +303,11 @@ def _item_counts(
     return counts
 
 
-# Graded components: progress_df column -> (item-count prefix, plural noun)
+# Graded components: progress_df column -> (item-count prefix, plural noun, what to improve)
 _GRADED = {
-    "problem_sets": ("ps", "problem sets"),
-    "quizzes": ("quiz", "quizzes"),
-    "webassign": ("webassign", "WebAssign assignments"),
+    "problem_sets": ("ps", "problem sets", "problem set scores"),
+    "quizzes": ("quiz", "quizzes", "quiz scores"),
+    "webassign": ("webassign", "WebAssign assignments", "WebAssign scores"),
 }
 
 
@@ -329,7 +329,7 @@ def _participation_parts(row: pd.Series, key: str) -> list[tuple[float, str, str
                 (
                     row["recitation_attendance"],
                     f"attended {present} of {total} recitations",
-                    f"recitation attendance ({present} of {total})",
+                    f"recitation attendance (attended {present} of {total})",
                 )
             )
         done, total = _done_total(row, "polls")
@@ -337,17 +337,17 @@ def _participation_parts(row: pd.Series, key: str) -> list[tuple[float, str, str
             (
                 row["polls_ratio"],
                 f"participated in polls in {done} of {total} lectures",
-                f"lecture polls ({done} of {total})",
+                f"lecture poll participation ({done} of {total} lectures)",
             )
         )
     else:
-        for prefix, ratio_col, noun in (
-            ("pre_quiz", "pre_quiz_ratio", "pre-class quizzes"),
-            ("pre_survey", "pre_survey_ratio", "pre-class surveys"),
+        for prefix, ratio_col, noun, focus in (
+            ("pre_quiz", "pre_quiz_ratio", "pre-class quizzes", "pre-class quiz completion"),
+            ("pre_survey", "pre_survey_ratio", "pre-class surveys", "pre-class survey completion"),
         ):
             done, total = _done_total(row, prefix)
             parts.append(
-                (row[ratio_col], f"{done} of {total} {noun}", f"{noun} ({done} of {total} done)")
+                (row[ratio_col], f"{done} of {total} {noun}", f"{focus} ({done} of {total} done)")
             )
     return parts
 
@@ -360,7 +360,7 @@ def _component_facts(row: pd.Series, key: str, midterm_label: str, low: float) -
         return f"scored {_pct(row['midterm_score'])} on {midterm_label}"
 
     if key in _GRADED:
-        prefix, noun = _GRADED[key]
+        prefix, noun, _ = _GRADED[key]
         done, total = _done_total(row, prefix)
         if total and not done:
             return f"no credit on any {noun} so far"
@@ -382,13 +382,13 @@ def _component_facts(row: pd.Series, key: str, midterm_label: str, low: float) -
 
 
 def _component_focus(row: pd.Series, key: str, midterm_label: str) -> str:
-    """Short form of a component to improve, e.g. 'quizzes (averaging 58%)'."""
+    """Short form of a component to improve, e.g. 'quiz scores (averaging 58%)'."""
     if key == "midterm_i":
         if not row["midterm_done"]:
-            return f"{midterm_label} (not taken)"
-        return f"{midterm_label} ({_pct(row['midterm_score'])})"
+            return f"exam scores (did not take {midterm_label})"
+        return f"exam scores ({midterm_label} was {_pct(row['midterm_score'])})"
     if key in _GRADED:
-        prefix, noun = _GRADED[key]
+        prefix, _, noun = _GRADED[key]
         done, total = _done_total(row, prefix)
         score = row[f"{prefix}_score"]
         detail = f"averaging {_pct(row[key] if pd.isna(score) else score)}"
@@ -472,7 +472,7 @@ def _indicator_and_comment(
             )
             return (
                 "Strong",
-                f"Strong progress overall. To improve: {focus(low_components)}.",
+                f"Strong progress overall. Work on improving: {focus(low_components)}.",
                 reason_code,
             )
         return (
@@ -499,7 +499,7 @@ def _indicator_and_comment(
         to_improve = [k for k, v in weakest if v < strong_threshold] or [weakest[0][0]]
         return (
             "Satisfactory",
-            f"Satisfactory progress. To improve: {focus(to_improve)}.",
+            f"Satisfactory progress. Work on improving: {focus(to_improve)}.",
             reason_code,
         )
 
