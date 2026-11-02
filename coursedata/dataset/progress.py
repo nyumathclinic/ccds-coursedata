@@ -4,7 +4,8 @@ Creates a syllabus-aligned progress CSV with columns:
 - Username
 - Name (Last, First)
 - Progress Indicator (Strong, Satisfactory, Concerns)
-- Comments
+- Comments (specific counts and scores, e.g. "did not take Midterm I",
+  "attended 3 of 7 recitations", "no credit on 2 of 4 problem sets")
 
 Configured under ``[tool.coursedata.progress_report]``: ``weights``,
 thresholds, ``midterm_label``, ``min_released_fraction``, ``data_sources``,
@@ -15,6 +16,9 @@ optionally ``webassign``) to its Brightspace gradebook category name.
 Grade items that have not been released yet are skipped: items whose name
 starts with a date after today, and items where no student has a positive
 score (e.g. future polls pre-filled with zeros).
+
+Attendance sessions named in the attendance data source's
+``exclude_sessions`` (e.g. ``["October 30"]``) are left out of the counts.
 
 CLI:
     python -m coursedata.dataset process midterm-progress
@@ -256,6 +260,150 @@ def _performance_ratio(df: pd.DataFrame, category: str) -> pd.Series:
     return subtotal_ratio.where(subtotal_ratio.notna(), ratio)
 
 
+def _item_counts(
+    df: pd.DataFrame, category: str | None, count_blanks: bool = True
+) -> pd.DataFrame:
+    """Per-student item counts for *category*, for comments.
+
+    Columns: ``done`` (items with credit), ``total`` (items counted, not
+    exempt), ``score`` (points earned over points possible, 0-1), and
+    ``submitted`` (the same over items with credit only). In Brightspace a
+    missed item is entered as 0, so "no credit" stands in for "missing".
+    With *count_blanks* false, blank items (e.g. not graded yet) are not
+    counted, as in Brightspace's subtotals.
+    """
+    counts = pd.DataFrame(
+        {"done": 0, "total": 0, "score": float("nan"), "submitted": float("nan")},
+        index=df.index,
+    )
+    if not category:
+        return counts
+    cols, _ = _active_category_columns(df, category)
+    earned = pd.Series(0.0, index=df.index)
+    possible = pd.Series(0.0, index=df.index)
+    earned_submitted = pd.Series(0.0, index=df.index)
+    possible_submitted = pd.Series(0.0, index=df.index)
+    for col in cols:
+        values = df[col].astype(str).str.strip()
+        counted = ~values.str.lower().eq("exempt")
+        if not count_blanks:
+            counted &= _entered(df[col])
+        numeric = pd.to_numeric(values, errors="coerce").fillna(0.0)
+        credited = numeric.gt(0) & counted
+        counts["done"] += credited.astype(int)
+        counts["total"] += counted.astype(int)
+        max_points = _max_points_from_header(col)
+        if max_points:
+            earned += numeric.where(counted, 0.0)
+            possible += counted.astype(float) * max_points
+            earned_submitted += numeric.where(credited, 0.0)
+            possible_submitted += credited.astype(float) * max_points
+    counts["score"] = (earned / possible).where(possible > 0)
+    counts["submitted"] = (earned_submitted / possible_submitted).where(possible_submitted > 0)
+    return counts
+
+
+# Graded components: progress_df column -> (item-count prefix, plural noun)
+_GRADED = {
+    "problem_sets": ("ps", "problem sets"),
+    "quizzes": ("quiz", "quizzes"),
+    "webassign": ("webassign", "WebAssign assignments"),
+}
+
+
+def _pct(x: float) -> str:
+    return f"{round(100 * float(x))}%"
+
+
+def _done_total(row: pd.Series, prefix: str) -> tuple[int, int]:
+    return int(row[f"{prefix}_done"]), int(row[f"{prefix}_total"])
+
+
+def _participation_parts(row: pd.Series, key: str) -> list[tuple[float, str, str]]:
+    """(ratio, fact, short form) for each part of a participation component."""
+    parts = []
+    if key == "attendance_participation":
+        present, total = int(row["rec_present"]), int(row["rec_total"])
+        if total:
+            parts.append(
+                (
+                    row["recitation_attendance"],
+                    f"attended {present} of {total} recitations",
+                    f"recitation attendance ({present} of {total})",
+                )
+            )
+        done, total = _done_total(row, "polls")
+        parts.append(
+            (
+                row["polls_ratio"],
+                f"participated in polls in {done} of {total} lectures",
+                f"lecture polls ({done} of {total})",
+            )
+        )
+    else:
+        for prefix, ratio_col, noun in (
+            ("pre_quiz", "pre_quiz_ratio", "pre-class quizzes"),
+            ("pre_survey", "pre_survey_ratio", "pre-class surveys"),
+        ):
+            done, total = _done_total(row, prefix)
+            parts.append(
+                (row[ratio_col], f"{done} of {total} {noun}", f"{noun} ({done} of {total} done)")
+            )
+    return parts
+
+
+def _component_facts(row: pd.Series, key: str, midterm_label: str, low: float) -> str:
+    """What lies behind a weak component, e.g. 'attended 3 of 7 recitations'."""
+    if key == "midterm_i":
+        if not row["midterm_done"]:
+            return f"did not take {midterm_label}"
+        return f"scored {_pct(row['midterm_score'])} on {midterm_label}"
+
+    if key in _GRADED:
+        prefix, noun = _GRADED[key]
+        done, total = _done_total(row, prefix)
+        if total and not done:
+            return f"no credit on any {noun} so far"
+        missed = total - done
+        if not missed:
+            score = row[f"{prefix}_score"]
+            return f"averaging {_pct(row[key] if pd.isna(score) else score)} on {noun}"
+        fact = f"no credit on {missed} of {total} {noun}"
+        submitted = row[f"{prefix}_submitted"]
+        if pd.notna(submitted) and submitted < low:
+            fact += f" and averaging {_pct(submitted)} on the others"
+        return fact
+
+    parts = _participation_parts(row, key)
+    picked = [fact for ratio, fact, _ in parts if ratio < low] or [min(parts)[1]]
+    if key == "preclass_assignments":
+        return "completed " + " and ".join(picked)
+    return "; ".join(picked)
+
+
+def _component_focus(row: pd.Series, key: str, midterm_label: str) -> str:
+    """Short form of a component to improve, e.g. 'quizzes (averaging 58%)'."""
+    if key == "midterm_i":
+        if not row["midterm_done"]:
+            return f"{midterm_label} (not taken)"
+        return f"{midterm_label} ({_pct(row['midterm_score'])})"
+    if key in _GRADED:
+        prefix, noun = _GRADED[key]
+        done, total = _done_total(row, prefix)
+        score = row[f"{prefix}_score"]
+        detail = f"averaging {_pct(row[key] if pd.isna(score) else score)}"
+        if total - done:
+            detail += f", no credit on {total - done} of {total}"
+        return f"{noun} ({detail})"
+    return min(_participation_parts(row, key))[2]
+
+
+def _join(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def _weighted_row_score(row: pd.Series, weights: dict[str, float], component_cols: list[str]) -> float:
     numerator = 0.0
     denom = 0.0
@@ -292,15 +440,22 @@ def _indicator_and_comment(
         for label, col in component_names.items()
         if col in row.index and pd.notna(row[col])
     }
-    suggestion_labels = {
-        "attendance/participation": "attendance and participation",
-        "pre-class assignments": "pre-class assignment completion",
-        "problem sets": "problem set performance",
-        "quizzes": "quiz performance",
-        "WebAssign": "WebAssign homework performance",
-        midterm_label: "exam performance",
-    }
-    performance = [k for k in ("problem sets", "quizzes", "WebAssign", midterm_label) if k in components]
+    # Order in which comments mention components: exam first, participation last
+    comment_order = [midterm_label, "problem sets", "quizzes", "WebAssign",
+                     "attendance/participation", "pre-class assignments"]
+
+    def facts(labels: list[str]) -> str:
+        ordered = sorted(labels, key=comment_order.index)
+        return "; ".join(
+            _component_facts(row, component_names[k], midterm_label, concerns_below_any)
+            for k in ordered
+        )
+
+    def focus(labels: list[str]) -> str:
+        ordered = sorted(labels, key=comment_order.index)
+        return _join([_component_focus(row, component_names[k], midterm_label) for k in ordered])
+
+    performance =[k for k in ("problem sets", "quizzes", "WebAssign", midterm_label) if k in components]
     performance_text = (
         ", ".join(performance[:-1]) + ", and " + performance[-1]
         if len(performance) > 1
@@ -312,13 +467,12 @@ def _indicator_and_comment(
 
     if overall >= strong_threshold:
         if low_components:
-            focus = ", ".join(suggestion_labels.get(k, k) for k in low_components)
             reason_code = "STRONG_WITH_LOW_" + "_".join(
                 k.upper().replace("/", "_").replace(" ", "_") for k in low_components
             )
             return (
                 "Strong",
-                f"Strong overall progress; consider also improving {focus}.",
+                f"Strong progress overall. To improve: {focus(low_components)}.",
                 reason_code,
             )
         return (
@@ -333,33 +487,29 @@ def _indicator_and_comment(
         reason_code = "LOW_COMPONENTS_" + "_".join(
             comp.upper().replace("/", "_").replace(" ", "_") for comp in low_components
         )
-        comments = (
-            "Concerns about progress due to low or missing performance in "
-            + ", ".join(low_components)
-            + "."
-        )
+        comments = f"Concerns about progress: {facts(low_components)}."
         return indicator, comments, reason_code
 
     if overall >= satisfactory_threshold:
         weakest = sorted(components.items(), key=lambda kv: kv[1])[:2]
-        focus = ", ".join(suggestion_labels.get(k, k) for k, _ in weakest)
         reason_code = "SATISFACTORY_FOCUS_" + "_".join(
             k.upper().replace("/", "_").replace(" ", "_") for k, _ in weakest
         )
+        # Don't suggest improving what is already at a Strong level
+        to_improve = [k for k, v in weakest if v < strong_threshold] or [weakest[0][0]]
         return (
             "Satisfactory",
-            f"Satisfactory progress overall; strengthen {focus} to see improvement.",
+            f"Satisfactory progress. To improve: {focus(to_improve)}.",
             reason_code,
         )
 
     weakest = sorted(components.items(), key=lambda kv: kv[1])[:2]
-    focus = ", ".join(suggestion_labels.get(k, k) for k, _ in weakest)
     reason_code = "CONCERNS_OVERALL_" + "_".join(
         k.upper().replace("/", "_").replace(" ", "_") for k, _ in weakest
     )
     return (
         "Concerns",
-        f"Concerns about progress; immediate improvement needed in {focus}.",
+        f"Concerns about progress: {facts([k for k, _ in weakest])}.",
         reason_code,
     )
 
@@ -386,6 +536,17 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
     grades_df = gb.grades.copy()
     attendance_df = att.data.copy()
 
+    excluded = list(attendance_cfg.get("exclude_sessions", []))
+    if excluded:
+        sessions = att.metadata.get("sessions", [])
+        unknown = [s for s in excluded if s not in sessions]
+        if unknown:
+            logger.warning(f"exclude_sessions not found in attendance: {', '.join(unknown)}")
+        kept = [s for s in sessions if s not in excluded]
+        for status in AttendanceData.statuses:
+            attendance_df[status] = attendance_df[kept].eq(status).sum(axis=1).astype(int)
+        logger.info(f"Excluding attendance session(s): {', '.join(excluded)}")
+
     categories = {**DEFAULT_CATEGORIES, **PROGRESS_REPORT_CONFIG.get("categories", {})}
 
     pre_quiz_ratio = _completion_ratio(grades_df, categories["pre_quizzes"])
@@ -405,6 +566,8 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
         attendance_df["P"] + 0.5 * attendance_df["R"]
     ) / (attendance_df["P"] + attendance_df["R"] + attendance_df["A"]).replace(0, pd.NA)
     attendance_df["recitation_attendance"] = attendance_df["recitation_attendance"].fillna(0.0)
+    attendance_df["rec_present"] = attendance_df["P"] + attendance_df["R"]
+    attendance_df["rec_total"] = attendance_df["P"] + attendance_df["R"] + attendance_df["A"]
 
     progress_df = pd.DataFrame(
         {
@@ -422,10 +585,30 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
         }
     )
 
+    # Item counts behind each component, for the comments. Blank participation items
+    # count as not done (as in the completion ratios); blank graded items are skipped.
+    for prefix, category, count_blanks in [
+        ("polls", categories["polls"], True),
+        ("pre_quiz", categories["pre_quizzes"], True),
+        ("pre_survey", categories["pre_surveys"], True),
+        ("ps", categories["problem_sets"], False),
+        ("quiz", categories["quizzes"], False),
+        ("webassign", categories["webassign"], False),
+        ("midterm", categories["midterm"], False),
+    ]:
+        counts = _item_counts(grades_df, category, count_blanks=count_blanks)
+        for col in counts.columns:
+            progress_df[f"{prefix}_{col}"] = counts[col]
+
     progress_df = progress_df.merge(
-        attendance_df[["Username", "recitation_attendance"]], on="Username", how="left"
+        attendance_df[["Username", "recitation_attendance", "rec_present", "rec_total"]],
+        on="Username",
+        how="left",
     )
     progress_df["recitation_attendance"] = progress_df["recitation_attendance"].fillna(0.0)
+    progress_df[["rec_present", "rec_total"]] = (
+        progress_df[["rec_present", "rec_total"]].fillna(0).astype(int)
+    )
 
     progress_df["attendance_participation"] = (
         progress_df["recitation_attendance"] + progress_df["polls_ratio"]
