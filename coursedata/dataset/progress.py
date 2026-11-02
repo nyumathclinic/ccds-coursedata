@@ -14,8 +14,18 @@ and ``categories``, which maps each component (``pre_quizzes``,
 optionally ``webassign``) to its Brightspace gradebook category name.
 
 Grade items that have not been released yet are skipped: items whose name
-starts with a date after today, and items where no student has a positive
-score (e.g. future polls pre-filled with zeros).
+starts with a date after today, items where no student has a positive
+score (e.g. future polls pre-filled with zeros), and, if a ``quizzes`` data
+source (``get brightspace quizzes``'s ``quizzes.json``) is configured,
+quizzes whose due date is still ahead.
+
+If a ``gradebook_structure`` data source (``edubag brightspace client
+save-gradebook-structure``) is configured, each category's drop rule is
+read from it: "dropping the lowest half" in the category description, else
+its number of lowest items to drop. Graded components in such a category
+are scored on each student's remaining best items. For drop-half
+categories, Concerns are raised only when fewer than
+``concerns_below_completion`` (default 0.50) of the items have credit.
 
 Attendance sessions named in the attendance data source's
 ``exclude_sessions`` (e.g. ``["October 30"]``) are left out of the counts.
@@ -26,6 +36,9 @@ CLI:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import html
+import json
 import re
 from pathlib import Path
 from typing import Annotated, Optional
@@ -45,6 +58,7 @@ from edubag.brightspace.attendance import AttendanceData
 from edubag.brightspace.gradebook import Gradebook
 
 from ._utils import d8
+from .brightspace import _parse_time
 from .engagement import _resolve_config_path, resolve_newest_matching_path
 
 
@@ -61,6 +75,10 @@ DEFAULT_CATEGORIES = {
 }
 
 _DATED_ITEM = re.compile(r"^(\d{4}-\d{2}-\d{2})\b")
+_DROP_HALF = re.compile(r"dropping the lowest half", re.IGNORECASE)
+
+# Quiz name -> due date, from the optional ``quizzes`` data source
+_due_dates: dict[str, datetime] = {}
 
 
 def _coalesce_source_config(source_name: str, default_type: str, default_path: str) -> dict:
@@ -82,6 +100,53 @@ def _resolve_source_file(source_cfg: dict) -> Path:
     return resolve_newest_matching_path(raw_path, stem_contains=source_cfg.get("stem_contains"))
 
 
+def _optional_source_file(source_name: str) -> Path | None:
+    """File for a data source used only when configured under progress_report."""
+    cfg = PROGRESS_REPORT_CONFIG.get("data_sources", {}).get(source_name)
+    if not cfg:
+        return None
+    try:
+        path = _resolve_source_file(dict(cfg))
+    except FileNotFoundError as e:
+        logger.warning(f"Ignoring {source_name} data source: {e}")
+        return None
+    logger.info(f"Using {source_name} file: {path}")
+    return path
+
+
+def _drop_rules(structure_path: Path) -> dict[str, str | int]:
+    """Category name -> "half" or number of lowest items dropped, from a structure export."""
+    rules: dict[str, str | int] = {}
+    for obj in json.loads(structure_path.read_text())["grade_objects"]:
+        if obj.get("kind") != "category":
+            continue
+        fields = {
+            f.get("name"): f.get("value")
+            for f in obj.get("tabs", {}).get("properties", {}).get("fields", [])
+        }
+        description = re.sub(r"<[^>]+>", " ", html.unescape(fields.get("Description") or ""))
+        if _DROP_HALF.search(description):
+            rules[obj["name"]] = "half"
+            continue
+        try:
+            n = int(fields.get("NumLowestGradesToDrop") or 0)
+        except ValueError:
+            n = 0
+        if n > 0:
+            rules[obj["name"]] = n
+    for category, rule in rules.items():
+        logger.info(f"{category}: dropping the lowest {rule}")
+    return rules
+
+
+def _quiz_due_dates(quizzes_path: Path) -> dict[str, datetime]:
+    return {
+        quiz["name"].strip(): _parse_time(quiz["due"])
+        for quiz in json.loads(quizzes_path.read_text())
+        if quiz.get("due")
+    }
+
+
 def _entered(values: pd.Series) -> pd.Series:
     normalized = values.astype(str).str.strip().str.lower()
     return ~(values.isna() | normalized.isin({"", "nan", "none", "-"}))
@@ -94,21 +159,27 @@ def _item_name(col: str) -> str:
 def _released_columns(df: pd.DataFrame, category: str) -> tuple[list[str], bool]:
     """Columns of *category*'s released grade items.
 
-    An item is unreleased when its name starts with a date after today or no
-    student has a positive score. The flag is true when an unreleased item
-    already has values entered (placeholder zeros), which Brightspace counts
-    in the category subtotal.
+    An item is unreleased when its name starts with a date after today, it is
+    a quiz not due yet, or no student has a positive score. The flag is true
+    when an unreleased item already has values entered (placeholder zeros),
+    which Brightspace counts in the category subtotal.
     """
     released: list[str] = []
     unreleased: list[str] = []
     subtotal_stale = False
+    now = datetime.now(timezone.utc)
     for col in df.columns:
         match = re.search(r"Category:(\w+[\w\s-]*?)\s+(?:CategoryWeight|>)", col)
         if not match or match.group(1).strip() != category:
             continue
         numeric = pd.to_numeric(df[col].astype(str).str.strip(), errors="coerce")
         dated = _DATED_ITEM.match(col)
-        if (dated and dated.group(1) > d8) or not numeric.gt(0).any():
+        due = _due_dates.get(_item_name(col).strip())
+        if (
+            (dated and dated.group(1) > d8)
+            or (due is not None and due > now)
+            or not numeric.gt(0).any()
+        ):
             unreleased.append(col)
             subtotal_stale = subtotal_stale or bool(_entered(df[col]).any())
         else:
@@ -260,6 +331,35 @@ def _performance_ratio(df: pd.DataFrame, category: str) -> pd.Series:
     return subtotal_ratio.where(subtotal_ratio.notna(), ratio)
 
 
+def _best_items_ratio(df: pd.DataFrame, category: str, drop: str | int) -> pd.Series:
+    """Average score on each student's best items after dropping the lowest.
+
+    *drop* is "half" or a number of items. Items count equally; exempt and
+    blank (not graded yet) items are skipped. NaN when no items count.
+    """
+    cols, _ = _active_category_columns(df, category)
+    scores = pd.DataFrame(index=df.index)
+    for col in cols:
+        max_points = _max_points_from_header(col)
+        if not max_points:
+            continue
+        values = df[col].astype(str).str.strip()
+        counted = _entered(df[col]) & ~values.str.lower().eq("exempt")
+        scores[col] = (pd.to_numeric(values, errors="coerce").fillna(0.0) / max_points).where(counted)
+
+    def best(row: pd.Series) -> float:
+        kept = row.dropna().sort_values(ascending=False)
+        n = len(kept)
+        if not n:
+            return float("nan")
+        keep = n - n // 2 if drop == "half" else max(n - int(drop), 1)
+        return float(kept.iloc[:keep].mean())
+
+    if scores.empty:
+        return pd.Series(float("nan"), index=df.index)
+    return scores.apply(best, axis=1)
+
+
 def _item_counts(
     df: pd.DataFrame, category: str | None, count_blanks: bool = True
 ) -> pd.DataFrame:
@@ -361,16 +461,19 @@ def _component_facts(row: pd.Series, key: str, midterm_label: str, low: float) -
 
     if key in _GRADED:
         prefix, noun, _ = _GRADED[key]
+        drops_half = f"{key}_completion" in row.index
         done, total = _done_total(row, prefix)
         if total and not done:
             return f"no credit on any {noun} so far"
         missed = total - done
-        if not missed:
+        if not missed or (drops_half and missed <= total // 2):
+            if drops_half:
+                return f"averaging {_pct(row[key])} on the best half of {noun}"
             score = row[f"{prefix}_score"]
             return f"averaging {_pct(row[key] if pd.isna(score) else score)} on {noun}"
         fact = f"no credit on {missed} of {total} {noun}"
         submitted = row[f"{prefix}_submitted"]
-        if pd.notna(submitted) and submitted < low:
+        if not drops_half and pd.notna(submitted) and submitted < low:
             fact += f" and averaging {_pct(submitted)} on the others"
         return fact
 
@@ -391,7 +494,10 @@ def _component_focus(row: pd.Series, key: str, midterm_label: str) -> str:
         prefix, _, noun = _GRADED[key]
         done, total = _done_total(row, prefix)
         score = row[f"{prefix}_score"]
-        detail = f"averaging {_pct(row[key] if pd.isna(score) else score)}"
+        if f"{key}_completion" in row.index:
+            detail = f"best half averaging {_pct(row[key])}"
+        else:
+            detail = f"averaging {_pct(row[key] if pd.isna(score) else score)}"
         if total - done:
             detail += f", no credit on {total - done} of {total}"
         return f"{noun} ({detail})"
@@ -426,6 +532,7 @@ def _indicator_and_comment(
     min_component_for_strong: float,
     concerns_below_any: float,
     midterm_label: str = "Midterm I",
+    concerns_below_completion: float = 0.50,
 ) -> tuple[str, str, str]:
     component_names = {
         "attendance/participation": "attendance_participation",
@@ -463,7 +570,15 @@ def _indicator_and_comment(
     )
     overall = float(row["overall_progress"])
 
-    low_components = [k for k, v in components.items() if v < concerns_below_any]
+    def is_low(label: str) -> bool:
+        # Lowest half dropped: only too few items with credit is a concern
+        completion_col = f"{component_names[label]}_completion"
+        if completion_col in row.index:
+            completion = row[completion_col]
+            return bool(pd.notna(completion) and completion < concerns_below_completion)
+        return components[label] < concerns_below_any
+
+    low_components = [k for k in components if is_low(k)]
 
     if overall >= strong_threshold:
         if low_components:
@@ -549,15 +664,27 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
 
     categories = {**DEFAULT_CATEGORIES, **PROGRESS_REPORT_CONFIG.get("categories", {})}
 
+    structure_path = _optional_source_file("gradebook_structure")
+    drop_rules = _drop_rules(structure_path) if structure_path else {}
+    quizzes_path = _optional_source_file("quizzes")
+    _due_dates.clear()
+    if quizzes_path:
+        _due_dates.update(_quiz_due_dates(quizzes_path))
+
+    def graded_ratio(category: str) -> pd.Series:
+        if category in drop_rules:
+            return _best_items_ratio(grades_df, category, drop_rules[category])
+        return _performance_ratio(grades_df, category)
+
     pre_quiz_ratio = _completion_ratio(grades_df, categories["pre_quizzes"])
     pre_survey_ratio = _completion_ratio(grades_df, categories["pre_surveys"])
     polls_ratio = _completion_ratio(grades_df, categories["polls"])
 
-    problem_sets_ratio = _performance_ratio(grades_df, categories["problem_sets"])
-    quizzes_ratio = _performance_ratio(grades_df, categories["quizzes"])
-    midterm_ratio = _performance_ratio(grades_df, categories["midterm"])
+    problem_sets_ratio = graded_ratio(categories["problem_sets"])
+    quizzes_ratio = graded_ratio(categories["quizzes"])
+    midterm_ratio = graded_ratio(categories["midterm"])
     webassign_ratio = (
-        _performance_ratio(grades_df, categories["webassign"])
+        graded_ratio(categories["webassign"])
         if categories["webassign"]
         else pd.Series(float("nan"), index=grades_df.index)
     )
@@ -599,6 +726,12 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
         counts = _item_counts(grades_df, category, count_blanks=count_blanks)
         for col in counts.columns:
             progress_df[f"{prefix}_{col}"] = counts[col]
+
+    # Share of items with credit, for graded components whose lowest half is dropped
+    for key, (prefix, _, _) in _GRADED.items():
+        if drop_rules.get(categories[key]) == "half":
+            total = progress_df[f"{prefix}_total"]
+            progress_df[f"{key}_completion"] = (progress_df[f"{prefix}_done"] / total).where(total > 0)
 
     progress_df = progress_df.merge(
         attendance_df[["Username", "recitation_attendance", "rec_present", "rec_total"]],
@@ -645,6 +778,9 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
     min_component_for_strong = float(PROGRESS_REPORT_CONFIG.get("min_component_for_strong", 0.70))
     concerns_below_any = float(PROGRESS_REPORT_CONFIG.get("concerns_below_any", 0.40))
     midterm_label = str(PROGRESS_REPORT_CONFIG.get("midterm_label", "Midterm I"))
+    concerns_below_completion = float(
+        PROGRESS_REPORT_CONFIG.get("concerns_below_completion", 0.50)
+    )
 
     indicators = progress_df.apply(
         lambda row: _indicator_and_comment(
@@ -654,6 +790,7 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
             min_component_for_strong=min_component_for_strong,
             concerns_below_any=concerns_below_any,
             midterm_label=midterm_label,
+            concerns_below_completion=concerns_below_completion,
         ),
         axis=1,
     )
