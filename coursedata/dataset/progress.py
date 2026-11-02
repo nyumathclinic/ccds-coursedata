@@ -6,6 +6,16 @@ Creates a syllabus-aligned progress CSV with columns:
 - Progress Indicator (Strong, Satisfactory, Concerns)
 - Comments
 
+Configured under ``[tool.coursedata.progress_report]``: ``weights``,
+thresholds, ``midterm_label``, ``min_released_fraction``, ``data_sources``,
+and ``categories``, which maps each component (``pre_quizzes``,
+``pre_surveys``, ``polls``, ``problem_sets``, ``quizzes``, ``midterm``, and
+optionally ``webassign``) to its Brightspace gradebook category name.
+
+Grade items that have not been released yet are skipped: items whose name
+starts with a date after today, and items where no student has a positive
+score (e.g. future polls pre-filled with zeros).
+
 CLI:
     python -m coursedata.dataset process midterm-progress
 """
@@ -36,6 +46,18 @@ from .engagement import _resolve_config_path, resolve_newest_matching_path
 
 app = typer.Typer(help="Generate syllabus-aligned midterm progress report.")
 
+DEFAULT_CATEGORIES = {
+    "pre_quizzes": "Pre-Quizzes",
+    "pre_surveys": "Pre-Surveys",
+    "polls": "Polls",
+    "problem_sets": "Problem Sets",
+    "quizzes": "Recitation Quizzes",
+    "midterm": "Midterm I",
+    "webassign": None,
+}
+
+_DATED_ITEM = re.compile(r"^(\d{4}-\d{2}-\d{2})\b")
+
 
 def _coalesce_source_config(source_name: str, default_type: str, default_path: str) -> dict:
     report_sources = PROGRESS_REPORT_CONFIG.get("data_sources", {})
@@ -56,16 +78,70 @@ def _resolve_source_file(source_cfg: dict) -> Path:
     return resolve_newest_matching_path(raw_path, stem_contains=source_cfg.get("stem_contains"))
 
 
-def _active_category_columns(df: pd.DataFrame, category: str) -> list[str]:
-    category_cols: list[str] = []
+def _entered(values: pd.Series) -> pd.Series:
+    normalized = values.astype(str).str.strip().str.lower()
+    return ~(values.isna() | normalized.isin({"", "nan", "none", "-"}))
+
+
+def _item_name(col: str) -> str:
+    return re.split(r"\s+(?:Points|Text) Grade\b", col)[0]
+
+
+def _released_columns(df: pd.DataFrame, category: str) -> tuple[list[str], bool]:
+    """Columns of *category*'s released grade items.
+
+    An item is unreleased when its name starts with a date after today or no
+    student has a positive score. The flag is true when an unreleased item
+    already has values entered (placeholder zeros), which Brightspace counts
+    in the category subtotal.
+    """
+    released: list[str] = []
+    unreleased: list[str] = []
+    subtotal_stale = False
     for col in df.columns:
         match = re.search(r"Category:(\w+[\w\s-]*?)\s+(?:CategoryWeight|>)", col)
-        if match and match.group(1).strip() == category:
-            normalized = df[col].astype(str).str.strip().str.lower()
-            is_blank = normalized.isin({"", "nan", "none", "-"})
-            if not is_blank.all():
-                category_cols.append(col)
-    return category_cols
+        if not match or match.group(1).strip() != category:
+            continue
+        numeric = pd.to_numeric(df[col].astype(str).str.strip(), errors="coerce")
+        dated = _DATED_ITEM.match(col)
+        if (dated and dated.group(1) > d8) or not numeric.gt(0).any():
+            unreleased.append(col)
+            subtotal_stale = subtotal_stale or bool(_entered(df[col]).any())
+        else:
+            released.append(col)
+    if unreleased:
+        logger.info(
+            f"{category}: skipping {len(unreleased)} unreleased item(s): "
+            + ", ".join(_item_name(c) for c in unreleased)
+        )
+    return released, subtotal_stale
+
+
+def _active_category_columns(df: pd.DataFrame, category: str) -> tuple[list[str], bool]:
+    """Released columns entered for enough students to count everyone else as missing.
+
+    Leaves out items still in progress (e.g. a pre-quiz only a few students
+    have reached), per ``min_released_fraction``.
+    """
+    cols, subtotal_stale = _released_columns(df, category)
+    min_fraction = float(PROGRESS_REPORT_CONFIG.get("min_released_fraction", 0.20))
+    in_progress = [c for c in cols if _entered(df[c]).mean() < min_fraction]
+    if in_progress:
+        logger.info(
+            f"{category}: not counting {len(in_progress)} item(s) entered for under "
+            f"{min_fraction:.0%} of students: " + ", ".join(_item_name(c) for c in in_progress)
+        )
+    return [c for c in cols if c not in in_progress], subtotal_stale
+
+
+def _category_ratio_base(df: pd.DataFrame, category: str) -> tuple[pd.Series, list[str]]:
+    """Brightspace subtotal ratio (NaN if it counts unreleased items) and item columns."""
+    subtotal_ratio = _subtotal_ratio(df, category)
+    cols, subtotal_stale = _active_category_columns(df, category)
+    if subtotal_stale:
+        logger.info(f"{category}: subtotal includes unreleased items; computing from items")
+        subtotal_ratio = pd.Series(float("nan"), index=df.index)
+    return subtotal_ratio, cols
 
 
 def _subtotal_ratio(df: pd.DataFrame, category: str) -> pd.Series:
@@ -100,9 +176,7 @@ def _subtotal_source(df: pd.DataFrame, category: str) -> pd.Series:
 
 
 def _completion_ratio(df: pd.DataFrame, category: str) -> pd.Series:
-    subtotal_ratio = _subtotal_ratio(df, category)
-
-    cols = _active_category_columns(df, category)
+    subtotal_ratio, cols = _category_ratio_base(df, category)
     if not cols:
         return subtotal_ratio
 
@@ -155,9 +229,7 @@ def _extract_lecture_section(sections_value: object) -> str:
 
 
 def _performance_ratio(df: pd.DataFrame, category: str) -> pd.Series:
-    subtotal_ratio = _subtotal_ratio(df, category)
-
-    cols = _active_category_columns(df, category)
+    subtotal_ratio, cols = _category_ratio_base(df, category)
     if not cols:
         return subtotal_ratio
 
@@ -205,21 +277,35 @@ def _indicator_and_comment(
     satisfactory_threshold: float,
     min_component_for_strong: float,
     concerns_below_any: float,
+    midterm_label: str = "Midterm I",
 ) -> tuple[str, str, str]:
+    component_names = {
+        "attendance/participation": "attendance_participation",
+        "pre-class assignments": "preclass_assignments",
+        "problem sets": "problem_sets",
+        "quizzes": "quizzes",
+        "WebAssign": "webassign",
+        midterm_label: "midterm_i",
+    }
     components = {
-        "attendance/participation": float(row["attendance_participation"]),
-        "pre-class assignments": float(row["preclass_assignments"]),
-        "problem sets": float(row["problem_sets"]),
-        "quizzes": float(row["quizzes"]),
-        "midterm I": float(row["midterm_i"]),
+        label: float(row[col])
+        for label, col in component_names.items()
+        if col in row.index and pd.notna(row[col])
     }
     suggestion_labels = {
         "attendance/participation": "attendance and participation",
         "pre-class assignments": "pre-class assignment completion",
         "problem sets": "problem set performance",
         "quizzes": "quiz performance",
-        "midterm I": "exam performance",
+        "WebAssign": "WebAssign homework performance",
+        midterm_label: "exam performance",
     }
+    performance = [k for k in ("problem sets", "quizzes", "WebAssign", midterm_label) if k in components]
+    performance_text = (
+        ", ".join(performance[:-1]) + ", and " + performance[-1]
+        if len(performance) > 1
+        else "".join(performance)
+    )
     overall = float(row["overall_progress"])
 
     low_components = [k for k, v in components.items() if v < concerns_below_any]
@@ -237,7 +323,8 @@ def _indicator_and_comment(
             )
         return (
             "Strong",
-            "Strong progress: consistent attendance/participation, pre-class completion, and strong performance on problem sets, quizzes, and Midterm I.",
+            "Strong progress: consistent attendance/participation, pre-class completion, "
+            f"and strong performance on {performance_text}.",
             "STRONG_ALL_COMPONENTS",
         )
 
@@ -299,13 +386,20 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
     grades_df = gb.grades.copy()
     attendance_df = att.data.copy()
 
-    pre_quiz_ratio = _completion_ratio(grades_df, "Pre-Quizzes")
-    pre_survey_ratio = _completion_ratio(grades_df, "Pre-Surveys")
-    polls_ratio = _completion_ratio(grades_df, "Polls")
+    categories = {**DEFAULT_CATEGORIES, **PROGRESS_REPORT_CONFIG.get("categories", {})}
 
-    problem_sets_ratio = _performance_ratio(grades_df, "Problem Sets")
-    quizzes_ratio = _performance_ratio(grades_df, "Recitation Quizzes")
-    midterm_ratio = _performance_ratio(grades_df, "Midterm I")
+    pre_quiz_ratio = _completion_ratio(grades_df, categories["pre_quizzes"])
+    pre_survey_ratio = _completion_ratio(grades_df, categories["pre_surveys"])
+    polls_ratio = _completion_ratio(grades_df, categories["polls"])
+
+    problem_sets_ratio = _performance_ratio(grades_df, categories["problem_sets"])
+    quizzes_ratio = _performance_ratio(grades_df, categories["quizzes"])
+    midterm_ratio = _performance_ratio(grades_df, categories["midterm"])
+    webassign_ratio = (
+        _performance_ratio(grades_df, categories["webassign"])
+        if categories["webassign"]
+        else pd.Series(float("nan"), index=grades_df.index)
+    )
 
     attendance_df["recitation_attendance"] = (
         attendance_df["P"] + 0.5 * attendance_df["R"]
@@ -323,6 +417,7 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
             "polls_ratio": polls_ratio,
             "problem_sets": problem_sets_ratio,
             "quizzes": quizzes_ratio,
+            "webassign": webassign_ratio,
             "midterm_i": midterm_ratio,
         }
     )
@@ -355,6 +450,7 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
         "preclass_assignments",
         "problem_sets",
         "quizzes",
+        "webassign",
         "midterm_i",
     ]
     progress_df["overall_progress"] = progress_df.apply(
@@ -365,6 +461,7 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
     satisfactory_threshold = float(PROGRESS_REPORT_CONFIG.get("satisfactory_threshold", 0.65))
     min_component_for_strong = float(PROGRESS_REPORT_CONFIG.get("min_component_for_strong", 0.70))
     concerns_below_any = float(PROGRESS_REPORT_CONFIG.get("concerns_below_any", 0.40))
+    midterm_label = str(PROGRESS_REPORT_CONFIG.get("midterm_label", "Midterm I"))
 
     indicators = progress_df.apply(
         lambda row: _indicator_and_comment(
@@ -373,6 +470,7 @@ def _build_midterm_progress_report(output_path: Optional[Path] = None) -> Path:
             satisfactory_threshold=satisfactory_threshold,
             min_component_for_strong=min_component_for_strong,
             concerns_below_any=concerns_below_any,
+            midterm_label=midterm_label,
         ),
         axis=1,
     )
