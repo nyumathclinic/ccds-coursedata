@@ -485,16 +485,32 @@ def sync_gradescope_sections(
             if username:
                 password = _get_password("gradescope.com", username)
 
+            # Visit configured courses by ID (robust to renames on Gradescope);
+            # fall back to matching course_name on the dashboard. Either way,
+            # pairing comes from each course's LTI link (lms_course_id) below.
+            configured_ids = [
+                _normalize_course_id(str(c)) for c in GRADESCOPE_CONFIG.get("courses", []) if c
+            ]
             client = GradescopeClient()
-            _call_with_headless(
-                client.fetch_class_details,
-                COURSE_NAME,
-                TERM_NAME,
-                output=details_path,
-                username=username,
-                password=password,
-                headless=headless,
-            )
+            if configured_ids:
+                _call_with_headless(
+                    client.fetch_class_details,
+                    course_ids=configured_ids,
+                    output=details_path,
+                    username=username,
+                    password=password,
+                    headless=headless,
+                )
+            else:
+                _call_with_headless(
+                    client.fetch_class_details,
+                    COURSE_NAME,
+                    TERM_NAME,
+                    output=details_path,
+                    username=username,
+                    password=password,
+                    headless=headless,
+                )
         if details_path is None:
             logger.error("No course IDs specified and no class details source provided.")
             raise typer.Exit(code=1)
