@@ -59,3 +59,15 @@ def test_no_date_settings_keeps_everything(tmp_path):
     # title_dates off: only quiz deadlines apply.
     future = engagement._future_item_columns(_grades(), {"quizzes_json": _quizzes(tmp_path)}, NOW)
     assert set(future) == {FUTURE_QUIZ, FUTURE_SURVEY}
+
+
+def test_denominators_subtract_unprefixed_base_gradebook_exemptions():
+    # The base gradebook's columns are merged without a "gradebook_" prefix.
+    cat = "Participation Data - PollEverywhere"
+    merged = pd.DataFrame({"Username": ["a", "b"], f"{cat}_exemptions": [0, 2]})
+    engagement._add_denominator_columns(
+        merged,
+        {"gradebook": {"type": "brightspace_gradebook"}},
+        {"gradebook": {cat: {"active_items": 18}}},
+    )
+    assert merged["gradebook_Participation_Data___PollEverywhere_denominator"].tolist() == [18, 16]

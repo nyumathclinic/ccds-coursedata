@@ -587,13 +587,19 @@ def _add_denominator_columns(
             for category, cat_meta in meta.items():
                 total = cat_meta.get("active_items", cat_meta.get("total_items", 0))
                 safe_cat = _sanitize(category)
-                exemptions_col = f"{src_name}_{category}_exemptions"
                 denom_col = f"{src_name}_{safe_cat}_denominator"
-                exemptions = (
-                    merged_df[exemptions_col]
-                    if exemptions_col in merged_df.columns
-                    else pd.Series(0, index=merged_df.index)
-                )
+                # The base gradebook's columns are merged unprefixed, other
+                # sources' with a "{source}_" prefix; accept either.
+                candidates = [f"{src_name}_{category}_exemptions", f"{category}_exemptions"]
+                exemptions_col = next((c for c in candidates if c in merged_df.columns), None)
+                if exemptions_col is None:
+                    logger.warning(
+                        f"  No exemptions column for {src_name}/{category} "
+                        f"(tried {candidates}); {denom_col} ignores exemptions."
+                    )
+                    exemptions = pd.Series(0, index=merged_df.index)
+                else:
+                    exemptions = merged_df[exemptions_col].fillna(0)
                 merged_df[denom_col] = (total - exemptions).clip(lower=0)
                 logger.debug(f"  {denom_col} = {total} - exemptions")
 
