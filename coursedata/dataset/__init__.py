@@ -8,6 +8,7 @@ Command groups:
 Use ``dataset <group> --help`` for details on each group.
 """
 
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -62,7 +63,7 @@ def get_callback(
             "--headless/--headed",
             help="Run browser headless (for automation) or headed (for debugging).",
         ),
-    ] = False,
+    ] = True,
 ) -> None:
     """Fetch raw data from all sources. Run without a subcommand to fetch everything."""
     ctx.ensure_object(dict)
@@ -190,6 +191,14 @@ def process_engagement_cmd(
         Optional[Path],
         typer.Option(help="Directory for report files (overrides configured report_path)."),
     ] = None,
+    as_of: Annotated[
+        Optional[datetime],
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M"],
+            help="Count only gradebook items due by this local date/time (default: now).",
+        ),
+    ] = None,
 ) -> None:
     """Compute engagement scores and save to PROCESSED_DATA_DIR."""
     _engagement._process_impl(
@@ -197,6 +206,7 @@ def process_engagement_cmd(
         keep_source_columns=keep_source_columns,
         with_report=report,
         report_dir=report_dir,
+        as_of=as_of,
     )
 
 
@@ -372,9 +382,17 @@ def report_engagement_cmd(
         Optional[Path],
         typer.Option(help="Directory for report files (overrides configured report_path)."),
     ] = None,
+    as_of: Annotated[
+        Optional[datetime],
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M"],
+            help="Count only gradebook items due by this local date/time (default: now).",
+        ),
+    ] = None,
 ) -> None:
     """Re-compute engagement and emit a validation report without saving a CSV."""
-    _engagement._report_impl(report_dir=report_dir)
+    _engagement._report_impl(report_dir=report_dir, as_of=as_of)
 
 
 @report_app.command("sections")
@@ -616,7 +634,7 @@ def _compat_brightspace_gradebooks(
             "--headless/--headed",
             help="Run browser headless (for automation) or headed (for debugging).",
         ),
-    ] = False,
+    ] = True,
 ) -> None:
     """[Deprecated] Use 'get brightspace gradebooks' instead."""
     typer.echo(
@@ -642,7 +660,7 @@ def _compat_brightspace_attendance(
             "--headless/--headed",
             help="Run browser headless (for automation) or headed (for debugging).",
         ),
-    ] = False,
+    ] = True,
 ) -> None:
     """[Deprecated] Use 'get brightspace attendance' instead."""
     typer.echo(

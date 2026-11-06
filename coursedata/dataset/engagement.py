@@ -42,6 +42,14 @@ Configuration schema (pyproject.toml)
     # inside the most-recently-dated subdirectory (YYYY-MM-DD format).
     # For brightspace_gradebook sources only:
     categories = ["Cat1", "Cat2"]
+    # Optional: drop items not yet due, from numerators *and* denominators.
+    # quizzes_json: a ``dataset get brightspace quizzes`` quiz list (relative to
+    # RAW_DATA_DIR); a gradebook item named like a quiz is due at its ``due``
+    # (else ``end``) time.
+    quizzes_json = "brightspace/quizzes/611388/quizzes.json"
+    # title_dates: an item whose name starts with YYYY-MM-DD (e.g.
+    # "2026-11-03 Polls - Participation") is due on that date.
+    title_dates = true
 
     # Column specifications – one table per output column:
     [[tool.coursedata.engagement.columns]]
@@ -95,6 +103,8 @@ download fresh data first.
 
 from __future__ import annotations
 
+from datetime import date, datetime
+import json
 import re
 from pathlib import Path
 from typing import Annotated, Any, Optional
@@ -126,6 +136,7 @@ from coursedata.config import (
     REPORTS_DIR,
 )
 from ._utils import d8
+from .brightspace import _quiz_deadline
 
 
 app = typer.Typer(help="Compute and report on student engagement scores.")
@@ -279,15 +290,66 @@ def _resolve_config_path(raw: str, default_base: Path) -> Path:
 # =========================================================================== #
 
 
+_TITLE_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})\b")
+
+
+def _item_name(col: str) -> str:
+    """The gradebook item name in a Brightspace export header.
+
+    ``"§8.4a Pre-Quiz Points Grade <Numeric MaxPoints:4 ...>"`` → ``"§8.4a Pre-Quiz"``.
+    """
+    name = col.split(" <", 1)[0]
+    for suffix in (" Points Grade", " Scheme Symbol", " Text Grade"):
+        name = name.removesuffix(suffix)
+    return name.strip()
+
+
+def _future_item_columns(
+    grades: "pd.DataFrame",  # type: ignore[name-defined]  # noqa: F821
+    source_cfg: dict[str, Any],
+    now: datetime,
+) -> list[str]:
+    """Gradebook columns whose items are not yet due as of *now*.
+
+    Uses the source's optional ``quizzes_json`` (quiz name → due, else end
+    time) and ``title_dates`` (a leading ``YYYY-MM-DD`` in the item name is
+    its due date; due through the end of that local day). Items neither
+    rule dates are kept.
+    """
+    deadlines: dict[str, datetime] = {}
+    if quizzes_json := source_cfg.get("quizzes_json"):
+        quiz_path = _resolve_config_path(quizzes_json, default_base=RAW_DATA_DIR)
+        for quiz in json.loads(quiz_path.read_text()):
+            if (deadline := _quiz_deadline(quiz)) is not None:
+                deadlines[quiz["name"].strip()] = deadline
+    title_dates = bool(source_cfg.get("title_dates", False))
+    today = now.astimezone().date()
+
+    future = []
+    for col in grades.columns:
+        if "<" not in col:  # identity columns (Username, names, …)
+            continue
+        name = _item_name(col)
+        if name in deadlines:
+            if deadlines[name] > now:
+                future.append(col)
+        elif title_dates and (m := _TITLE_DATE.match(name)):
+            if date.fromisoformat(m.group(1)) > today:
+                future.append(col)
+    return future
+
+
 def _load_source(
     name: str,
     source_cfg: dict[str, Any],
+    now: Optional[datetime] = None,
 ) -> tuple["DataSource", list[str], dict[str, Any]]:
     """Load one data source as described by *source_cfg*.
 
     Args:
         name: Logical name for the source (used as the merge prefix).
         source_cfg: Sub-dictionary from ``[tool.coursedata.engagement.data_sources.<name>]``.
+        now: Cutoff for "not yet due" gradebook items (default: the current time).
 
     Returns:
         A 3-tuple of ``(source, categories, category_metadata)``.
@@ -316,6 +378,18 @@ def _load_source(
         if stale:
             source.grades = source.grades.drop(columns=stale)
             source.data = source.grades.copy()
+        # Drop items not yet due *before* the transformer parses categories, so
+        # they count in neither {category}_positive nor the denominators.
+        future_cols = _future_item_columns(
+            source.grades, source_cfg, now or datetime.now().astimezone()
+        )
+        if future_cols:
+            logger.info(
+                f"  {name}: excluding {len(future_cols)} items not yet due: "
+                + ", ".join(_item_name(c) for c in future_cols)
+            )
+            source.grades = source.grades.drop(columns=future_cols)
+            source.data = source.grades.copy()
         if categories:
             transformer = GradebookTransformer(source)
             transformer.add_category_metrics(categories)
@@ -333,6 +407,9 @@ def _load_source(
                 meta["active_items"] = len(active_cols)
                 meta["excluded_blank_columns"] = [
                     col for col in category_cols if col not in active_cols
+                ]
+                meta["excluded_future_columns"] = [
+                    col for col in future_cols if f"Category:{cat} " in col
                 ]
 
                 if meta["excluded_blank_columns"]:
@@ -683,6 +760,7 @@ def _process_impl(
     save_csv: bool = True,
     with_report: bool = True,
     report_dir: Optional[Path] = None,
+    as_of: Optional[datetime] = None,
 ) -> None:
     """Compute engagement scores and write them to *output_path*.
 
@@ -699,6 +777,8 @@ def _process_impl(
         with_report: Print a validation report and save warnings to
             *report_dir*.
         report_dir: Override the configured ``report_path``.
+        as_of: Treat gradebook items due after this time as not yet due
+            (default: now). A naive datetime is taken as local time.
     """
     if not _EDUBAG_AVAILABLE:
         logger.error(
@@ -751,13 +831,15 @@ def _process_impl(
     # Load sources                                                         #
     # ------------------------------------------------------------------ #
     logger.info("Loading data sources…")
+    now = (as_of or datetime.now()).astimezone()
+    logger.info(f"Counting gradebook items due by {now:%Y-%m-%d %H:%M %Z}")
     sources: dict[str, DataSource] = {}
     gradebook_source: Optional[Gradebook] = None
     category_metadatas: dict[str, dict] = {}
 
     for src_name, src_cfg in source_cfgs.items():
         try:
-            source, _, cat_meta = _load_source(src_name, src_cfg)
+            source, _, cat_meta = _load_source(src_name, src_cfg, now=now)
         except FileNotFoundError as exc:
             logger.warning(f"Skipping source '{src_name}': {exc}")
             continue
@@ -892,9 +974,11 @@ def _emit_report(
         logger.info(f"Warnings saved → {warn_path}")
 
 
-def _report_impl(report_dir: Optional[Path] = None) -> None:
+def _report_impl(
+    report_dir: Optional[Path] = None, as_of: Optional[datetime] = None
+) -> None:
     """Re-run engagement computation and emit a report without saving the CSV."""
-    _process_impl(save_csv=False, with_report=True, report_dir=report_dir)
+    _process_impl(save_csv=False, with_report=True, report_dir=report_dir, as_of=as_of)
 
 
 # =========================================================================== #
@@ -942,6 +1026,14 @@ def process_command(
             help="Directory for report files (overrides the configured report_path)."
         ),
     ] = None,
+    as_of: Annotated[
+        Optional[datetime],
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M"],
+            help="Count only gradebook items due by this local date/time (default: now).",
+        ),
+    ] = None,
 ) -> None:
     """Compute engagement scores and save to PROCESSED_DATA_DIR."""
     _process_impl(
@@ -949,6 +1041,7 @@ def process_command(
         keep_source_columns=keep_source_columns,
         with_report=report,
         report_dir=report_dir,
+        as_of=as_of,
     )
 
 
@@ -960,13 +1053,21 @@ def report_command(
             help="Directory for report files (overrides the configured report_path)."
         ),
     ] = None,
+    as_of: Annotated[
+        Optional[datetime],
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M"],
+            help="Count only gradebook items due by this local date/time (default: now).",
+        ),
+    ] = None,
 ) -> None:
     """Re-compute engagement and emit a validation report without saving a CSV.
 
     Useful when you only want to inspect statistics or refresh the warnings
     file without overwriting the processed output.
     """
-    _report_impl(report_dir=report_dir)
+    _report_impl(report_dir=report_dir, as_of=as_of)
 
 
 # =========================================================================== #

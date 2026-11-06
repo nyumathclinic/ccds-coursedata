@@ -31,7 +31,7 @@ def _section_ids() -> list[str]:
 def _fetch_impl(
     kind: str,
     output_dir: Optional[Path] = None,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Save a dated download ("roster" or "scores") for each configured section."""
     if not WEBASSIGN_AVAILABLE:
@@ -101,7 +101,7 @@ def process_all() -> None:
     _process_impl()
 
 
-def run_all(headless: bool = False) -> None:
+def run_all(headless: bool = True) -> None:
     """Run all WebAssign fetch commands."""
     _fetch_impl("roster", headless=headless)
     _fetch_impl("scores", headless=headless)
@@ -111,7 +111,7 @@ def run_all(headless: bool = False) -> None:
 def webassign_callback(ctx: typer.Context) -> None:
     """Fetch all WebAssign data. Run without a subcommand to fetch everything."""
     if ctx.invoked_subcommand is None:
-        headless = (ctx.obj or {}).get("headless", False)
+        headless = (ctx.obj or {}).get("headless", True)
         run_all(headless=headless)
 
 
@@ -123,7 +123,7 @@ def rosters(
     ] = None,
 ) -> None:
     """Fetch the roster for each configured WebAssign section."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _fetch_impl("roster", output_dir=output_dir, headless=headless)
 
 
@@ -135,5 +135,5 @@ def scores(
     ] = None,
 ) -> None:
     """Fetch assignment scores for each configured WebAssign section."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _fetch_impl("scores", output_dir=output_dir, headless=headless)

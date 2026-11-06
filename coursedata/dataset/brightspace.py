@@ -25,7 +25,7 @@ app = typer.Typer(help="Fetch data from Brightspace.")
 def _gradebooks_impl(
     output_dir: Optional[Path] = None,
     clean: bool = False,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching Brightspace gradebooks."""
     if not BRIGHTSPACE_AVAILABLE:
@@ -69,7 +69,7 @@ def _gradebooks_impl(
 def _attendance_impl(
     output_dir: Optional[Path] = None,
     clean: bool = False,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching Brightspace attendance files."""
     if not BRIGHTSPACE_AVAILABLE:
@@ -101,12 +101,20 @@ def _attendance_impl(
         logger.error(f"Brightspace authentication failed: {e}")
         raise typer.Exit(code=1)
 
+    # Courses without attendance registers save nothing (not an error). Keep
+    # going past a failed course so one bad course doesn't block the others.
+    failed = []
     for course in course_ids:
         try:
-            client.save_attendance(course, save_dir=output_dir, headless=headless)
+            saved = client.save_attendance(course, save_dir=output_dir, headless=headless)
         except Exception as e:
             logger.error(f"Failed to fetch attendance for course {course}: {e}")
-            raise typer.Exit(code=1)
+            failed.append(course)
+            continue
+        if not saved:
+            logger.info(f"Course {course}: no attendance registers; skipped.")
+    if failed:
+        raise typer.Exit(code=1)
     logger.success("Brightspace attendance fetched successfully.")
 
 
@@ -181,7 +189,7 @@ def _quizzes_impl(
     due: bool = False,
     force: bool = False,
     list_only: bool = False,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching Brightspace quiz reports.
 
@@ -300,7 +308,7 @@ def _quizzes_impl(
         logger.success("Brightspace quiz reports fetched successfully.")
 
 
-def run_all(headless: bool = False) -> None:
+def run_all(headless: bool = True) -> None:
     """Run all Brightspace fetch commands."""
     _gradebooks_impl(headless=headless)
     _attendance_impl(headless=headless)
@@ -310,7 +318,7 @@ def run_all(headless: bool = False) -> None:
 def brightspace_callback(ctx: typer.Context) -> None:
     """Fetch all Brightspace data. Run without a subcommand to fetch everything."""
     if ctx.invoked_subcommand is None:
-        headless = (ctx.obj or {}).get("headless", False)
+        headless = (ctx.obj or {}).get("headless", True)
         run_all(headless=headless)
 
 
@@ -326,7 +334,7 @@ def gradebooks(
     ] = False,
 ) -> None:
     """Fetch Brightspace gradebooks for configured courses and save to output_dir."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _gradebooks_impl(output_dir=output_dir, clean=clean, headless=headless)
 
 
@@ -343,7 +351,7 @@ def attendance(
     ] = False,
 ) -> None:
     """Fetch Brightspace attendance files for configured courses and save to output_dir."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _attendance_impl(output_dir=output_dir, clean=clean, headless=headless)
 
 
@@ -376,7 +384,7 @@ def quizzes(
     A quiz's reports are fetched when first seen (once it has opened) and once
     more after its due date; later runs skip them unless --force.
     """
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _quizzes_impl(
         output_dir=output_dir,
         quiz=quiz,

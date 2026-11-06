@@ -43,7 +43,7 @@ def _get_gradescope_credentials() -> tuple[Optional[str], Optional[str]]:
 
 def _class_details_impl(
     output: Optional[Path] = None,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching Gradescope class details."""
     if not EDUBAG_AVAILABLE:
@@ -71,7 +71,7 @@ def _class_details_impl(
 def _rosters_impl(
     output_dir: Optional[Path] = None,
     clean: bool = False,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching Gradescope rosters."""
     if not EDUBAG_AVAILABLE:
@@ -112,7 +112,7 @@ def _rosters_impl(
     logger.success("Gradescope rosters fetched successfully.")
 
 
-def run_all(headless: bool = False) -> None:
+def run_all(headless: bool = True) -> None:
     """Run all Gradescope fetch commands."""
     _class_details_impl(headless=headless)
     _rosters_impl(headless=headless)
@@ -122,7 +122,7 @@ def run_all(headless: bool = False) -> None:
 def gradescope_callback(ctx: typer.Context) -> None:
     """Fetch all Gradescope data. Run without a subcommand to fetch everything."""
     if ctx.invoked_subcommand is None:
-        headless = (ctx.obj or {}).get("headless", False)
+        headless = (ctx.obj or {}).get("headless", True)
         run_all(headless=headless)
 
 
@@ -134,7 +134,7 @@ def class_details(
     ] = None,
 ) -> None:
     """Fetch all Gradescope class details for the specified course and term, and save to output."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _class_details_impl(output=output, headless=headless)
 
 
@@ -150,7 +150,7 @@ def rosters(
     ] = False,
 ) -> None:
     """Fetch Gradescope rosters for configured courses and save to output_dir."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _rosters_impl(output_dir=output_dir, clean=clean, headless=headless)
 
 
@@ -171,7 +171,7 @@ def grading_cmd(
     """Snapshot an exam's grading progress and scores from Gradescope (all parts and versions)."""
     from .grading import _get_impl
 
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _get_impl(exam, headless=headless, scores=scores, homework=homework)
 
 
@@ -202,7 +202,7 @@ def submissions_cmd(
     if not EDUBAG_AVAILABLE:
         logger.error("edubag module is not available. Cannot export Gradescope submissions.")
         raise typer.Exit(code=1)
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     save_dir = RAW_DATA_DIR / "artifacts" / exam_dir
     username, password = _get_gradescope_credentials()
     client = GradescopeClient()

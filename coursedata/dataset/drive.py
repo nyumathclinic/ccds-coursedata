@@ -288,7 +288,7 @@ def _download_configured_resources(
     return downloads
 
 
-def run_all(headless: bool = False) -> None:
+def run_all(headless: bool = True) -> None:
     """Download all configured Google Drive resources."""
     del headless
     _download_configured_resources(strict=False)

@@ -76,7 +76,7 @@ def _rosters_impl(
     convert_to_csv: bool = True,
     csv_output_dir: Optional[Path] = None,
     clean: bool = False,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching Albert rosters."""
     if not EDUBAG_AVAILABLE:
@@ -161,7 +161,7 @@ def _rosters_impl(
 
 def _class_details_impl(
     output: Optional[Path] = None,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching Albert class details."""
     if not EDUBAG_AVAILABLE:
@@ -209,7 +209,7 @@ def _class_details_impl(
     logger.success("Class details fetched successfully.")
 
 
-def _photo_rosters_impl(headless: bool = False) -> None:
+def _photo_rosters_impl(headless: bool = True) -> None:
     """Fetch HTML rosters with student photos for the configured class numbers.
 
     Only the latest copy of each is kept, in
@@ -261,7 +261,7 @@ def _photo_rosters_impl(headless: bool = False) -> None:
     logger.success("Photo rosters fetched.")
 
 
-def run_all(headless: bool = False) -> None:
+def run_all(headless: bool = True) -> None:
     """Run all Albert fetch commands."""
     _rosters_impl(headless=headless)
     _class_details_impl(headless=headless)
@@ -271,7 +271,7 @@ def run_all(headless: bool = False) -> None:
 def albert_callback(ctx: typer.Context) -> None:
     """Fetch all Albert data. Run without a subcommand to fetch everything."""
     if ctx.invoked_subcommand is None:
-        headless = (ctx.obj or {}).get("headless", False)
+        headless = (ctx.obj or {}).get("headless", True)
         run_all(headless=headless)
 
 
@@ -293,7 +293,7 @@ def rosters(
     ] = False,
 ) -> None:
     """Fetch all rosters for the specified course and term, and save to output_dir."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _rosters_impl(
         output_dir=output_dir,
         convert_to_csv=convert_to_csv,
@@ -311,12 +311,12 @@ def class_details(
     ] = None,
 ) -> None:
     """Fetch all class details for the specified course and term, and save to output."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _class_details_impl(output=output, headless=headless)
 
 
 @app.command("photo-rosters")
 def photo_rosters(ctx: typer.Context) -> None:
     """Fetch HTML rosters with student photos for the configured photo_rosters class numbers."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _photo_rosters_impl(headless=headless)

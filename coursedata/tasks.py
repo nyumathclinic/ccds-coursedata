@@ -96,7 +96,7 @@ def _normalize_course_id(value: str) -> str:
     return value
 
 
-def _call_with_headless(func, *args, headless: bool = False, **kwargs):
+def _call_with_headless(func, *args, headless: bool = True, **kwargs):
     try:
         return func(*args, headless=headless, **kwargs)
     except TypeError:

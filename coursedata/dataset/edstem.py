@@ -21,7 +21,7 @@ app = typer.Typer(help="Fetch data from EdStem.")
 
 
 def _get_edstem_credentials() -> tuple[Optional[str], Optional[str]]:
-    """Get EdStem username and password from environment and keychain."""
+    """Get EdStem username and password from environment (.env), then keychain."""
     username = os.getenv("EDSTEM_USERNAME")
     if not username:
         logger.warning(
@@ -29,8 +29,8 @@ def _get_edstem_credentials() -> tuple[Optional[str], Optional[str]]:
         )
         username = None
 
-    password = None
-    if username:
+    password = os.getenv("EDSTEM_PASSWORD") or None
+    if username and not password:
         password = get_password("edstem.org", username)
         if not password:
             logger.warning(
@@ -44,7 +44,7 @@ def _get_edstem_credentials() -> tuple[Optional[str], Optional[str]]:
 def _analytics_impl(
     output_dir: Optional[Path] = None,
     clean: bool = False,
-    headless: bool = False,
+    headless: bool = True,
 ) -> None:
     """Core implementation for fetching EdStem analytics."""
     if not EDSTEM_AVAILABLE:
@@ -89,7 +89,7 @@ def _analytics_impl(
     logger.success("EdStem analytics fetched successfully.")
 
 
-def run_all(headless: bool = False) -> None:
+def run_all(headless: bool = True) -> None:
     """Run all EdStem fetch commands."""
     _analytics_impl(headless=headless)
 
@@ -98,7 +98,7 @@ def run_all(headless: bool = False) -> None:
 def edstem_callback(ctx: typer.Context) -> None:
     """Fetch all EdStem data. Run without a subcommand to fetch everything."""
     if ctx.invoked_subcommand is None:
-        headless = (ctx.obj or {}).get("headless", False)
+        headless = (ctx.obj or {}).get("headless", True)
         run_all(headless=headless)
 
 
@@ -114,5 +114,5 @@ def analytics(
     ] = False,
 ) -> None:
     """Fetch EdStem analytics for configured courses and save to output_dir."""
-    headless = (ctx.obj or {}).get("headless", False)
+    headless = (ctx.obj or {}).get("headless", True)
     _analytics_impl(output_dir=output_dir, clean=clean, headless=headless)
