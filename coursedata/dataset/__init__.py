@@ -17,6 +17,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 import typer
 from coursedata.config import DAILY_CONFIG
 
+from . import aim as _aim
 from . import albert as _albert
 from . import artifacts as _artifacts
 from . import brightspace as _brightspace
@@ -94,6 +95,7 @@ get_app.add_typer(_drive.app, name="drive")
 get_app.add_typer(_gradescope.app, name="gradescope")
 get_app.add_typer(_edstem.app, name="edstem")
 get_app.add_typer(_webassign.app, name="webassign")
+get_app.command("aim")(_aim.aim_cmd)  # per exam / scheduled, so not in the bare `get`
 
 app.add_typer(get_app, name="get")
 
