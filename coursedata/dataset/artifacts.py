@@ -1595,7 +1595,9 @@ def process_exam_dir(raw_dir: Path, out_root: Path, dry_run: bool = False) -> Pa
             else:
                 exam_doc.close()
             version_subs = subs_by_version.get(version, [])
-            template = templates[template_stems[version]]
+            # Only versions with exported submissions have their base template loaded: an exam
+            # version may be all personalized exams, matched against their own templates.
+            template = templates[template_stems[version]] if version_subs else None
             for sub in version_subs:
                 with pymupdf.open(stream=sub.pdf, filetype="pdf") as doc:
                     sub.page_index = find_bubblesheet_page(sub, doc, template)
