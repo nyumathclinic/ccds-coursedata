@@ -17,7 +17,8 @@ reads::
 the ZIPs in ``_zips/`` there and a record of what was fetched in ``aim-manifest.json``. A row is
 fetched again only if its "Uploaded On" date changes (a rescan), or with ``--force``.
 ``get aim`` alone does this for every configured exam that is still active: from ``date`` to
-``fetch_days`` after its last date, since scans are uploaded after the exam.
+``fetch_days`` after its last date, since scans are uploaded after the exam. ``get aim --all``
+does it for every configured exam, active or not.
 """
 
 from __future__ import annotations
@@ -102,10 +103,13 @@ def exam_spec(name: str, cfg: dict) -> ExamSpec:
 
 
 def select_specs(
-    names: list[str], overrides: dict, today: date
+    names: list[str], overrides: dict, today: date, include_inactive: bool = False
 ) -> list[ExamSpec]:
-    """The exams to fetch: those named (config + overrides), or else all active configured ones."""
+    """The exams to fetch: those named (config + overrides), or else all active configured ones
+    (all configured ones with ``include_inactive``)."""
     exams = configured_exams()
+    if include_inactive and (names or overrides):
+        raise ConfigError("--all takes no exam names or filters")
     if overrides and len(names) != 1:
         raise ConfigError("Filter options apply to exactly one exam name (the artifacts folder)")
     if names:
@@ -116,6 +120,8 @@ def select_specs(
             )
         return [exam_spec(n, {**exams.get(n, {}), **overrides}) for n in names]
     specs = [exam_spec(n, cfg) for n, cfg in exams.items()]
+    if include_inactive:
+        return specs
     active = [s for s in specs if s.active(today)]
     for s in specs:
         if s not in active:
@@ -233,6 +239,7 @@ def aim_cmd(
         Optional[list[str]],
         typer.Argument(help="Exam names from [tool.coursedata.aim.exams] (default: all active ones)"),
     ] = None,
+    all_exams: Annotated[bool, typer.Option("--all", help="Every configured exam, active or not")] = False,
     list_only: Annotated[bool, typer.Option("--list", help="Show matching rows; download nothing")] = False,
     force: Annotated[bool, typer.Option(help="Download rows already fetched, too")] = False,
     crn: Annotated[Optional[list[str]], typer.Option(help="CRN filter (repeatable); overrides config")] = None,
@@ -262,12 +269,12 @@ def aim_cmd(
         overrides.setdefault("until", None)
         overrides.setdefault("grace_days", None)
     try:
-        specs = select_specs(list(exams or []), overrides, date.today())
+        specs = select_specs(list(exams or []), overrides, date.today(), include_inactive=all_exams)
     except ConfigError as e:
         logger.error(str(e))
         raise typer.Exit(code=2) from e
     if not specs:
-        logger.info("No AIM exams are active today.")
+        logger.info("No AIM exams are configured." if all_exams else "No AIM exams are active today.")
         return
 
     client = AimClient()

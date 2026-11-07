@@ -158,3 +158,12 @@ def test_list_only_downloads_nothing(config, capsys):
     assert client.calls == 0
     assert not (spec.save_dir / aim.MANIFEST).exists()
     assert "new" in capsys.readouterr().out
+
+
+def test_select_all_includes_inactive(config):
+    assert aim.select_specs([], {}, date(2026, 12, 1)) == []
+    assert [s.name for s in aim.select_specs([], {}, date(2026, 12, 1), include_inactive=True)] == ["ch7"]
+    with pytest.raises(aim.ConfigError, match="--all"):
+        aim.select_specs(["ch7"], {}, date(2026, 11, 7), include_inactive=True)
+    with pytest.raises(aim.ConfigError, match="--all"):
+        aim.select_specs([], {"crn": ["1"]}, date(2026, 11, 7), include_inactive=True)
