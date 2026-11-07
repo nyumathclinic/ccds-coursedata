@@ -1,10 +1,12 @@
 from pathlib import Path
+import re
 
 import numpy as np
 import pytest
 
 from coursedata.dataset.artifacts import (
     Exam,
+    TESTING_CENTER_FILE,
     ScannedPage,
     assign_pages,
     base_version,
@@ -14,6 +16,9 @@ from coursedata.dataset.artifacts import (
     hold_reason,
     infer_missing_serials,
     is_exam_serial,
+    is_testing_center_form,
+    mark_form_backs,
+    marked_fraction,
     personalize,
     read_ledger,
     rescan_warning,
@@ -460,3 +465,49 @@ def test_duplicate_reason_stamped():
     assert "batch b1" in duplicate_reason(sub, stems)
     sub.original_filename = "ch6-21A-bubblesheets-b1.pdf"
     assert duplicate_reason(sub, stems) is None
+
+
+def test_is_testing_center_form():
+    assert is_testing_center_form(["E12740317416842"])
+    assert not is_testing_center_form(["12681048811054017"])  # an exam serial
+    assert not is_testing_center_form([])
+
+
+def _form_page(index, form=False, ink=0.0, **kw):
+    p = _page("aim.pdf", index, **kw)
+    p.form, p.ink = form, ink
+    return p
+
+
+def test_mark_form_backs_drops_nearly_blank_back_only():
+    pages = [_form_page(0, form=True, ink=0.05), _form_page(1, ink=0.001), _form_page(2, ink=0.001, aztec="v.qns")]
+    mark_form_backs(pages)
+    assert [p.blank for p in pages] == [False, True, False]
+    assert "back of the testing-center form" in pages[1].warnings[0]
+
+    written = [_form_page(0, form=True), _form_page(1, ink=0.01)]  # something written on the back
+    mark_form_backs(written)
+    assert not written[1].blank
+
+
+def test_marked_fraction_ignores_scanner_border_and_streaks():
+    page = np.full((2200, 1700), 255, np.uint8)
+    page[:, :60] = 0  # dark scanner background along one side
+    page[300:1800, 900:903] = 180  # a faint vertical streak
+    assert marked_fraction(page) < 0.0005
+    for x in range(400, 900, 25):  # some pen strokes
+        page[1000:1040, x : x + 5] = 0
+    assert marked_fraction(page) > 0.0005
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("(11057CN) E12740317416842.pdf", True),
+        ("(1105HTZ) E37384878634187_compressed.pdf", True),
+        ("20261105124255001.pdf", False),
+        ("Bethi_Vedh.pdf", False),
+    ],
+)
+def test_testing_center_file_names(name, expected):
+    assert bool(re.fullmatch(TESTING_CENTER_FILE, name)) is expected

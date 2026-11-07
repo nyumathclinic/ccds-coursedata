@@ -19,7 +19,9 @@ writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<
 * ``<version>-<timestamp>.pdf``: the batch's exams of that version, sorted by serial number, with
   each exam's pages put in template order. A missing page is replaced by the blank template page; a scanned
   page that matches no template page is appended after the exam's template pages, unless it is
-  totally blank, in which case it is dropped.
+  totally blank, in which case it is dropped. A testing-center form (the Moses Center's proctor
+  instruction sheet, recognized by its own Code39, see ``testing_center_form``) is never matched to
+  an exam page and always goes last; its back is dropped when nearly blank.
 * ``<version>-bubblesheets-<timestamp>.pdf``: only the bubblesheet pages, in the same order. A
   blank Name or ID box is filled with an image of what the student wrote in the matching box on
   the cover.
@@ -116,11 +118,22 @@ MAX_SHIFT = 80
 # the template page's; an assignment costing more than the threshold is rejected, so the codes
 # always win.
 FEATURE_PENALTY = 5.0
+FORM_COST = 1e6  # matching cost of a testing-center form against any template page
 MATCH_COST_THRESHOLD = float(ARTIFACTS_CONFIG.get("match_cost_threshold", 3.0))
 # Fraction of a box's pixels that must be new ink for the box to count as filled in.
 INK_THRESHOLD = float(ARTIFACTS_CONFIG.get("ink_threshold", 0.002))
 # An unmatched page with less than this fraction of marked pixels is totally blank and dropped.
 BLANK_PAGE_THRESHOLD = float(ARTIFACTS_CONFIG.get("blank_page_threshold", 0.0005))
+# Code39 text (regex, full match) of the testing center's form for each exam it proctors (Moses
+# Center: "E" + digits). Such a page goes after the exam; "" turns this off.
+TESTING_CENTER_FORM = ARTIFACTS_CONFIG.get("testing_center_form", r"E\d+")
+# The page right after such a form is its back; it is dropped below this marked fraction (looser
+# than BLANK_PAGE_THRESHOLD: the printed front shows through).
+FORM_BACK_THRESHOLD = float(ARTIFACTS_CONFIG.get("form_back_threshold", 0.002))
+# File name (regex, full match) of the testing center's downloads, e.g. "(11057CN) E1274...pdf":
+# their first page is the form even when its barcode doesn't decode (compressed scans).
+TESTING_CENTER_FILE = ARTIFACTS_CONFIG.get("testing_center_file", r"\(\w+\) E\d+.*\.pdf")
+FORM_RETRY_DPI = 400  # second try at a first page's form barcode
 
 ARUCO_DICT = cv2.aruco.DICT_5X5_50
 BUBBLESHEET_MARKER_IDS = {0, 1, 2, 3}
@@ -253,15 +266,40 @@ def warp_to(img: np.ndarray, transform: np.ndarray, shape: tuple[int, int]) -> n
 
 
 def marked_fraction(img: np.ndarray) -> float:
-    """Fraction of a page marked relative to its local background (works on colored paper)."""
+    """Fraction of a page marked relative to its local background (works on colored paper).
+
+    Scanner artifacts don't count: the dark background around a skewed or undersized page
+    (dark regions touching the image edge), a margin of the page, and streaks (long marks a few
+    pixels wide).
+    """
+    marks = cv2.adaptiveThreshold(
+        img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 25
+    )
+    _, labels = cv2.connectedComponents((img < 100).astype(np.uint8), connectivity=8)
+    edge = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    edge = edge[edge != 0]
+    if edge.size:
+        background = cv2.dilate(
+            np.isin(labels, edge).astype(np.uint8), np.ones((15, 15), np.uint8)
+        )
+        marks[background > 0] = 0
     h, w = img.shape
     m = int(0.05 * min(h, w))  # ignore scanner edges
-    inner = img[m : h - m, m : w - m]
-    marks = cv2.adaptiveThreshold(
-        inner, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 25
-    )
-    marks = cv2.morphologyEx(marks, cv2.MORPH_OPEN, np.ones((3, 3)))
+    marks = cv2.morphologyEx(marks[m : h - m, m : w - m], cv2.MORPH_OPEN, np.ones((3, 3)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(marks, connectivity=8)
+    long_side = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+    short_side = np.minimum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+    streaks = [k for k in range(1, n) if long_side[k] >= 100 and short_side[k] <= 8]
+    if streaks:
+        marks[np.isin(labels, streaks)] = 0
     return float(np.count_nonzero(marks)) / marks.size
+
+
+def is_testing_center_form(code39_texts: list[str]) -> bool:
+    """Whether a page's Code39 barcodes include the testing center's form code."""
+    return bool(TESTING_CENTER_FORM) and any(
+        re.fullmatch(TESTING_CENTER_FORM, t) for t in code39_texts
+    )
 
 
 def ink_recall_cost(scan_ink: np.ndarray, tpl_ink: np.ndarray, distinct: np.ndarray) -> float:
@@ -362,6 +400,8 @@ class ScannedPage:
     image: bytes  # PNG of align_image()
     blank: bool
     warnings: list[str] = field(default_factory=list)
+    form: bool = False  # the testing center's form (see TESTING_CENTER_FORM)
+    ink: float = 0.0  # marked_fraction() of the page
 
     @property
     def ref(self) -> str:
@@ -371,7 +411,8 @@ class ScannedPage:
         return cv2.imdecode(np.frombuffer(self.image, np.uint8), cv2.IMREAD_GRAYSCALE)
 
 
-def read_code39(page: pymupdf.Page, results) -> tuple[str | None, list[str]]:
+def read_code39(page: pymupdf.Page, results) -> tuple[str | None, list[str], list[str]]:
+    """(exam serial, warnings, all decoded Code39 texts) of a page."""
     texts = [r.text for r in results if r.format == zxingcpp.BarcodeFormat.Code39]
     if not texts:
         strip = to_gray(page, RETRY_DPI)
@@ -389,8 +430,34 @@ def read_code39(page: pymupdf.Page, results) -> tuple[str | None, list[str]]:
             serials.add(serial)
     if len(serials) > 1:
         warnings.append(f"several Code39 serials on one page: {sorted(serials)}")
-        return None, warnings
-    return (serials.pop() if serials else None), warnings
+        return None, warnings, texts
+    return (serials.pop() if serials else None), warnings, texts
+
+
+def find_form_on_first_page(pdf_path: Path, doc: pymupdf.Document, first: ScannedPage) -> None:
+    """Recognize the testing-center form on a file's first page if the first read missed it."""
+    if first.form or first.serial or first.aztec or first.bubblesheet or not TESTING_CENTER_FORM:
+        return
+    img = to_gray(doc[0], FORM_RETRY_DPI)
+    strip = img[: int(img.shape[0] * 0.2)]
+    texts = [r.text for r in zxingcpp.read_barcodes(strip, formats=zxingcpp.BarcodeFormat.Code39)]
+    if is_testing_center_form(texts):
+        first.form = True
+    elif TESTING_CENTER_FILE and re.fullmatch(TESTING_CENTER_FILE, pdf_path.name):
+        first.form = True
+        first.warnings.append("taken for the testing-center form by its file name")
+
+
+def mark_form_backs(pages: list[ScannedPage]) -> None:
+    """Mark the nearly blank back of each testing-center form (the page after it) blank."""
+    for form, back in zip(pages, pages[1:]):
+        if (
+            form.form
+            and not (back.form or back.serial or back.aztec or back.bubblesheet or back.blank)
+            and back.ink < FORM_BACK_THRESHOLD
+        ):
+            back.blank = True
+            back.warnings.append("back of the testing-center form; dropped")
 
 
 def scan_stack(pdf_path: Path) -> list[ScannedPage]:
@@ -400,8 +467,9 @@ def scan_stack(pdf_path: Path) -> list[ScannedPage]:
         for index, page in enumerate(doc):
             img = to_gray(page)
             results = zxingcpp.read_barcodes(img)
-            serial, warnings = read_code39(page, results)
+            serial, warnings, code39 = read_code39(page, results)
             aztecs = [r.text for r in results if r.format == zxingcpp.BarcodeFormat.Aztec]
+            ink = marked_fraction(img)
             pages.append(
                 ScannedPage(
                     source=pdf_path,
@@ -410,10 +478,15 @@ def scan_stack(pdf_path: Path) -> list[ScannedPage]:
                     aztec=aztecs[0] if aztecs else None,
                     bubblesheet=len(detect_bubblesheet_markers(img)) >= 3,
                     image=cv2.imencode(".png", align_image(img))[1].tobytes(),
-                    blank=marked_fraction(img) < BLANK_PAGE_THRESHOLD,
+                    blank=ink < BLANK_PAGE_THRESHOLD,
                     warnings=warnings,
+                    form=is_testing_center_form(code39),
+                    ink=ink,
                 )
             )
+        if pages:
+            find_form_on_first_page(pdf_path, doc, pages[0])
+    mark_form_backs(pages)
     inferred = infer_missing_serials(
         [p.serial for p in pages], [p.aztec is not None for p in pages]
     )
@@ -1041,6 +1114,8 @@ class Exam:
             self.warnings.append(f"no cover; version {self.template.version} inferred")
         transforms = self.template.align_pages(self.pages)
         cost = self.template.cost_matrix(self.pages, transforms)
+        forms = [i for i, p in enumerate(self.pages) if p.form]
+        cost[forms, :] = FORM_COST  # testing-center forms are never exam pages
         slots, extras = assign_pages(cost, MATCH_COST_THRESHOLD)
 
         def render(i: int) -> np.ndarray:
@@ -1052,13 +1127,20 @@ class Exam:
             return warp_to(img, t, letter_size(DPI)[::-1])
 
         self.slots = self.template.refine(slots, render)
-        self.extras = [i for i in extras if not self.pages[i].blank]
+        kept = [i for i in extras if not self.pages[i].blank]
+        # The exam's own cover leads; a testing-center form goes after everything else.
+        self.extras = [i for i in kept if not self.pages[i].form] + [
+            i for i in kept if self.pages[i].form
+        ]
         self.dropped = [i for i in extras if self.pages[i].blank]
         for j, slot in enumerate(self.slots):
             if slot is None:
                 self.warnings.append(f"template page {j + 1} missing; blank template inserted")
         for i in self.extras:
-            self.warnings.append(f"{self.pages[i].ref} matches no template page; appended")
+            if self.pages[i].form:
+                self.warnings.append(f"{self.pages[i].ref} is the testing-center form; put last")
+            else:
+                self.warnings.append(f"{self.pages[i].ref} matches no template page; appended")
         for p in self.pages:
             self.warnings += [f"{p.ref}: {w}" for w in p.warnings]
 
