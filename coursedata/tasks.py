@@ -196,11 +196,11 @@ def sync_gradescope_rosters(
     else:
         # Ensure the environment variable is set for any downstream use
         os.environ["GRADESCOPE_USERNAME"] = username
-        # Check for password presence in keyring and guide setup if missing
-        pw = keyring.get_password(keyring_service, username)
+        # Check for a password (.env or Keychain, as edubag's login reads it) and guide setup if missing
+        pw = os.getenv("GRADESCOPE_PASSWORD") or keyring.get_password(keyring_service, username)
         if not pw:
             logger.warning(
-                f"Password for '{username}' not found in Keychain (service '{keyring_service}'). Add it via:"
+                f"Password for '{username}' not found in $GRADESCOPE_PASSWORD (.env) or Keychain (service '{keyring_service}'). Set one, e.g.:"
             )
             logger.warning(
                 f"security add-generic-password -s {keyring_service} -a {username} -w YOUR_PASSWORD"
@@ -272,10 +272,10 @@ def post_gradescope_grades(
         )
     else:
         os.environ["GRADESCOPE_USERNAME"] = username
-        pw = keyring.get_password(keyring_service, username)
+        pw = os.getenv("GRADESCOPE_PASSWORD") or keyring.get_password(keyring_service, username)
         if not pw:
             logger.warning(
-                f"Password for '{username}' not found in Keychain (service '{keyring_service}'). Add it via:"
+                f"Password for '{username}' not found in $GRADESCOPE_PASSWORD (.env) or Keychain (service '{keyring_service}'). Set one, e.g.:"
             )
             logger.warning(
                 f"security add-generic-password -s {keyring_service} -a {username} -w YOUR_PASSWORD"
