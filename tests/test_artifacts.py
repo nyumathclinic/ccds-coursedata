@@ -13,6 +13,7 @@ from coursedata.dataset.artifacts import (
     code39_check_char,
     forget_batch,
     group_exams,
+    unbarcoded_starts,
     hold_reason,
     infer_missing_serials,
     is_exam_serial,
@@ -92,6 +93,17 @@ def test_assign_pages_restores_order():
     assert extras == []
 
 
+def test_assign_pages_prefers_scan_order_on_near_ties():
+    # Pages 1 and 2 swapped would be cheaper by 0.04 (noise); a real misplacement costs ~1.
+    cost = np.full((3, 3), 2.0)
+    np.fill_diagonal(cost, 0.5)
+    cost[1, 2] = cost[2, 1] = 0.48
+    assert assign_pages(cost, 3.0)[0] == [0, 2, 1]
+    assert assign_pages(cost, 3.0, [0, 1, 2], 0.15)[0] == [0, 1, 2]
+    cost[1, 2] = cost[2, 1] = 0.0  # clearly swapped: still reordered
+    assert assign_pages(cost, 3.0, [0, 1, 2], 0.15)[0] == [0, 2, 1]
+
+
 def test_assign_pages_missing_page():
     slots, extras = assign_pages(_cost([0, 1, 3], 4), threshold=3.0)
     assert slots == [0, 1, None, 2]
@@ -125,13 +137,13 @@ def test_is_exam_serial():
     assert is_exam_serial("E82941240129493") is None
 
 
-def _page(source: str, index: int, serial=None, aztec=None) -> ScannedPage:
+def _page(source: str, index: int, serial=None, aztec=None, bubblesheet=False) -> ScannedPage:
     return ScannedPage(
         source=Path(source),
         index=index,
         serial=serial,
         aztec=aztec,
-        bubblesheet=False,
+        bubblesheet=bubblesheet,
         image=b"",
         blank=False,
     )
@@ -171,6 +183,53 @@ def test_group_exams_splits_unbarcoded_file_at_covers():
     assert exams[0].pages == pages[:3]
     assert exams[1].pages == pages[3:]
     assert all(hold_reason(e, {}) is None for e in exams)
+
+
+def _noisy_stack(n_exams: int, length: int, covers_read: set[int], bubble_at: int = 2):
+    """Exams of ``length`` pages back to back; only the covers of exams in ``covers_read`` read."""
+    return [
+        _page(
+            "n.pdf",
+            i,
+            aztec="v.qns" if i % length == 0 and i // length in covers_read else None,
+            bubblesheet=i % length == bubble_at,
+        )
+        for i in range(n_exams * length)
+    ]
+
+
+def test_group_exams_splits_noisy_stack_at_bubblesheets():
+    # Three 5-page exams; only the first cover read; bubblesheets on pages 2, 7, 12.
+    pages = _noisy_stack(3, 5, {0})
+    exams, unassigned = group_exams({Path("n.pdf"): pages}, {Path("n.pdf"): "e" * 64})
+    assert unassigned == []
+    assert [e.pages for e in exams] == [pages[0:5], pages[5:10], pages[10:15]]
+    assert exams[0].warnings == []
+    assert "bubblesheet on page 8" in exams[1].warnings[0]
+    assert "bubblesheet on page 13" in exams[2].warnings[0]
+    assert all(e.version_hint == "v.qns" for e in exams)
+
+
+def test_group_exams_noisy_stack_mixed_covers():
+    # Covers of exams 0 and 2 read, 1 and 3 not: cover splits stay, the others come from bubblesheets.
+    pages = _noisy_stack(4, 5, {0, 2})
+    starts, notes = unbarcoded_starts(pages)
+    assert starts == [0, 5, 10, 15]
+    assert sorted(notes) == [5, 15]
+
+
+def test_group_exams_without_any_cover_stays_one_exam():
+    pages = _noisy_stack(3, 5, set())
+    exams, _ = group_exams({Path("n.pdf"): pages}, {Path("n.pdf"): "e" * 64})
+    assert len(exams) == 1 and exams[0].version_hint is None
+
+
+def test_group_exams_no_hint_when_covers_disagree():
+    pages = _noisy_stack(3, 5, {0, 1})
+    pages[5].aztec = "w.qns"
+    exams, _ = group_exams({Path("n.pdf"): pages}, {Path("n.pdf"): "e" * 64})
+    assert len(exams) == 3
+    assert all(e.version_hint is None for e in exams)
 
 
 def test_hold_reason():

@@ -11,7 +11,9 @@ carries ArUco markers 0-3 in its corners. Scanner PDFs come in two kinds:
 * barcoded stacks of concatenated exams, where every page carries a Code39 serial number (the
   last character is a mod-43 check character) identifying its exam;
 * unbarcoded PDFs (e.g. from the testing center), each holding one exam, or several back to
-  back, each starting at its cover.
+  back, each starting at its cover. (A stack scanned too noisily for its barcodes lands here too;
+  an exam whose cover can't be read is then found from its bubblesheet, and takes its version
+  from the file's other covers.)
 
 Runs are incremental. Each run processes only raw PDFs not seen before (by content hash) and
 writes the exams in them to a new batch folder, ``PROCESSED_DATA_DIR/artifacts/<exam>/<timestamp>/``:
@@ -116,8 +118,13 @@ MAX_SHIFT = 80
 # Each alone mismatches some real pages; the sum separated true from false matches by >= 0.2
 # on the ch6 scans. FEATURE_PENALTY is added when a page's cover/bubblesheet codes disagree with
 # the template page's; an assignment costing more than the threshold is rejected, so the codes
-# always win.
+# always win. One exception: a page whose Aztec code didn't read may still be the cover, since
+# a noisy scan can lose the code while the page still looks like the cover.
 FEATURE_PENALTY = 5.0
+# Scanner order is usually right: a page stays in its scanned position unless moving it lowers
+# the cost by more than this. On clean scans, a misplaced page is off by about 1; on noisy
+# (dithered) scans, the best and the scanned order can differ by only ~0.02 per page.
+SCAN_ORDER_BONUS = float(ARTIFACTS_CONFIG.get("scan_order_bonus", 0.15))
 FORM_COST = 1e6  # matching cost of a testing-center form against any template page
 MATCH_COST_THRESHOLD = float(ARTIFACTS_CONFIG.get("match_cost_threshold", 3.0))
 # Fraction of a box's pixels that must be new ink for the box to count as filled in.
@@ -330,20 +337,26 @@ def barcode_corners(result) -> np.ndarray:
     )
 
 
-def assign_pages(cost: np.ndarray, threshold: float) -> tuple[list[int | None], list[int]]:
+def assign_pages(
+    cost: np.ndarray, threshold: float, scan_order: list[int] | None = None, order_bonus: float = 0.0
+) -> tuple[list[int | None], list[int]]:
     """Assign scanned pages (rows) to template pages (columns).
 
     Returns ``(slots, extras)``: ``slots[j]`` is the scanned page index for template page ``j``
     (``None`` if missing), and ``extras`` are scanned page indices matching no template page,
-    in scan order.
+    in scan order. ``scan_order[k]`` is the scanned page expected at template page ``k`` if the
+    exam was scanned in order; that pairing gets ``order_bonus`` off its cost when choosing the
+    assignment (not when applying ``threshold``).
     """
     n_scan, n_tpl = cost.shape
     # A tiny penalty on displacement makes interchangeable pages (blank scratch pages) keep
     # their scan order.
     rows = np.arange(n_scan)[:, None] / max(n_scan, 1)
     cols = np.arange(n_tpl)[None, :] / max(n_tpl, 1)
-    tie_break = 1e-3 * np.abs(rows - cols)
-    row_ind, col_ind = linear_sum_assignment(cost + tie_break)
+    objective = cost + 1e-3 * np.abs(rows - cols)
+    for k, r in enumerate((scan_order or [])[:n_tpl]):
+        objective[r, k] -= order_bonus
+    row_ind, col_ind = linear_sum_assignment(objective)
     slots: list[int | None] = [None] * n_tpl
     assigned = set()
     for r, c in zip(row_ind, col_ind):
@@ -746,7 +759,7 @@ class Template:
             ]
         scan_cover = np.array([p.aztec is not None for p in pages])[:, None]
         scan_bubble = np.array([p.bubblesheet for p in pages])[:, None]
-        cost += FEATURE_PENALTY * (scan_cover != np.array(self.is_cover)[None, :])
+        cost += FEATURE_PENALTY * (scan_cover & ~np.array(self.is_cover)[None, :])
         cost += FEATURE_PENALTY * (scan_bubble != np.array(self.is_bubblesheet)[None, :])
         return cost
 
@@ -1069,6 +1082,7 @@ class Exam:
     filled: dict[str, bool] = field(default_factory=dict)
     held: str | None = None  # why the exam is held back from upload
     warnings: list[str] = field(default_factory=list)
+    version_hint: str | None = None  # unbarcoded: the one Aztec read on this file's covers
 
     @property
     def barcoded(self) -> bool:
@@ -1105,6 +1119,11 @@ class Exam:
             self.warnings.append(f"several cover versions: {sorted(covers)}")
         if covers & templates.keys():
             self.template = templates[min(covers & templates.keys())]
+        elif self.version_hint in templates:
+            self.template = templates[self.version_hint]
+            self.warnings.append(
+                f"no cover; version {self.template.version} taken from the file's other covers"
+            )
         else:
             # No readable cover: pick the version whose template fits best.
             self.template = min(
@@ -1116,7 +1135,8 @@ class Exam:
         cost = self.template.cost_matrix(self.pages, transforms)
         forms = [i for i, p in enumerate(self.pages) if p.form]
         cost[forms, :] = FORM_COST  # testing-center forms are never exam pages
-        slots, extras = assign_pages(cost, MATCH_COST_THRESHOLD)
+        in_order = [i for i, p in enumerate(self.pages) if not p.form]
+        slots, extras = assign_pages(cost, MATCH_COST_THRESHOLD, in_order, SCAN_ORDER_BONUS)
 
         def render(i: int) -> np.ndarray:
             """Page ``i`` at DPI, aligned to the template frame."""
@@ -1152,6 +1172,46 @@ class Exam:
         return self.slots == list(range(len(self.slots))) and not self.extras and not self.dropped
 
 
+def unbarcoded_starts(pages: list[ScannedPage]) -> tuple[list[int], dict[int, str]]:
+    """Where the exams in an unbarcoded file start, and a warning for each start found indirectly.
+
+    An exam starts at each cover read (the first exam also takes any pages before its cover). When
+    a scan is too noisy for a cover's Aztec code, its bubblesheet's ArUco markers usually still
+    read: a bubblesheet with no cover read since the previous bubblesheet starts a new exam ``d``
+    pages before it, where ``d`` is how far the bubblesheet usually lies after a cover read in this
+    file. A file with several bubblesheets and no cover read is left as one exam.
+    """
+    covers = [i for i, p in enumerate(pages) if p.aztec is not None]
+    starts = {0} | set(covers[1:])
+    bubbles = [i for i, p in enumerate(pages) if p.bubblesheet]
+    notes: dict[int, str] = {}
+    offsets: Counter[int] = Counter()
+    prev = -1
+    for b in bubbles:
+        before = [c for c in covers if prev < c <= b]
+        if before:
+            offsets[b - before[-1]] += 1
+        prev = b
+    if len(bubbles) > 1 and not offsets:
+        logger.warning(
+            f"{pages[0].source.name}: {len(bubbles)} bubblesheets but no cover read; kept as one exam"
+        )
+    if offsets:
+        d = offsets.most_common(1)[0][0]
+        prev = -1
+        for b in bubbles:
+            if not any(prev < c <= b for c in covers):
+                start = b - d
+                if start > max(s for s in starts if s <= b):
+                    starts.add(start)
+                    notes[start] = (
+                        f"no cover read; exam taken to start {d} pages before the bubblesheet "
+                        f"on page {b + 1}"
+                    )
+            prev = b
+    return sorted(starts), notes
+
+
 def group_exams(
     pages_by_file: dict[Path, list[ScannedPage]], hashes: dict[Path, str]
 ) -> tuple[list[Exam], list[ScannedPage]]:
@@ -1160,7 +1220,8 @@ def group_exams(
     In a file where some page carries an exam serial, pages are grouped by serial (across all
     files, so an exam split between files is reassembled); pages without one are unassigned. A
     file where no page carries a serial holds unbarcoded exams, one starting at each cover
-    (pages before the first cover belong to the first exam). A file of one exam is keyed by its
+    (pages before the first cover belong to the first exam), or where a cover can't be read, at
+    its bubblesheet (see ``unbarcoded_starts``). A file of one exam is keyed by its
     hash and labeled by its name; the n-th of several is keyed ``<hash>:<n>`` and labeled
     ``<stem>-<n><suffix>``.
     """
@@ -1171,19 +1232,23 @@ def group_exams(
             for p in pages:
                 (by_serial[p.serial] if p.serial else unassigned).append(p)
             continue
-        groups: list[list[ScannedPage]] = [[]]
-        for p in pages:
-            if p.aztec is not None and any(q.aztec is not None for q in groups[-1]):
-                groups.append([])
-            groups[-1].append(p)
+        starts, notes = unbarcoded_starts(pages)
+        groups = [pages[a:b] for a, b in zip(starts, starts[1:] + [len(pages)])]
         key = f"file:{hashes[path][:16]}"
         if len(groups) == 1:
-            exams.append(Exam(key=key, label=path.name, pages=groups[0]))
+            file_exams = [Exam(key=key, label=path.name, pages=groups[0])]
         else:
-            exams += [
+            file_exams = [
                 Exam(key=f"{key}:{n}", label=f"{path.stem}-{n}{path.suffix}", pages=group)
                 for n, group in enumerate(groups, 1)
             ]
+        covers = {p.aztec for p in pages if p.aztec is not None}
+        for start, exam in zip(starts, file_exams):
+            if start in notes:
+                exam.warnings.append(notes[start])
+            if len(covers) == 1:
+                exam.version_hint = next(iter(covers))
+        exams += file_exams
     exams += [Exam(key=f"serial:{s}", label=s, pages=ps) for s, ps in by_serial.items()]
     return exams, unassigned
 
