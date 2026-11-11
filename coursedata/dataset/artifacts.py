@@ -992,8 +992,15 @@ def fill_bubblesheet(
         dest = map_rect(box.writing_area, tpl_to_scan)
         inset = 2
         dest = pymupdf.Rect(dest.x0 + inset, dest.y0 + inset, dest.x1 - inset, dest.y1 - inset)
+        # As in insert_fitting_text: insert_image takes unrotated coordinates, and a scan stored
+        # sideways (shown upright by /Rotate) needs the image turned to match.
+        if bubble_page.rotation:
+            dest = dest * bubble_page.derotation_matrix
         bubble_page.insert_image(
-            dest, stream=handwriting_png(cover, cover_box, cover_mask), keep_proportion=True
+            dest,
+            stream=handwriting_png(cover, cover_box, cover_mask),
+            keep_proportion=True,
+            rotate=text_rotation(bubble_page, tpl_to_scan),
         )
         filled[key] = True
         logger.info(f"bubblesheet {key} was blank; filled from the cover")
