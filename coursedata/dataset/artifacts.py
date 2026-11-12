@@ -129,6 +129,9 @@ FORM_COST = 1e6  # matching cost of a testing-center form against any template p
 MATCH_COST_THRESHOLD = float(ARTIFACTS_CONFIG.get("match_cost_threshold", 3.0))
 # Fraction of a box's pixels that must be new ink for the box to count as filled in.
 INK_THRESHOLD = float(ARTIFACTS_CONFIG.get("ink_threshold", 0.002))
+# Gray level (0-255) below which a scanned pixel counts as handwriting. Light pencil runs
+# 160-200; blank boxes on scans stay clear of 215, so 200 keeps faint names from passing for blank.
+INK_DARKNESS = int(ARTIFACTS_CONFIG.get("ink_darkness", 200))
 # An unmatched page with less than this fraction of marked pixels is totally blank and dropped.
 BLANK_PAGE_THRESHOLD = float(ARTIFACTS_CONFIG.get("blank_page_threshold", 0.0005))
 # Code39 text (regex, full match) of the testing center's form for each exam it proctors (Moses
@@ -812,7 +815,7 @@ def new_ink(registered: np.ndarray, template_img: np.ndarray, box: Box) -> np.nd
     the box's outline rect (in template DPI pixels) with the label and border excluded.
     """
     x0, y0, x1, y1 = _px(box.rect)
-    scan = registered[y0:y1, x0:x1] < 160
+    scan = registered[y0:y1, x0:x1] < INK_DARKNESS
     printed = cv2.dilate((template_img[y0:y1, x0:x1] < 200).astype(np.uint8), np.ones((9, 9)))
     mask = scan & ~printed.astype(bool)
     keep = np.zeros_like(mask)
