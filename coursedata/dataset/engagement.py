@@ -339,6 +339,21 @@ def _future_item_columns(
     return future
 
 
+def _source_file_info(source_cfg: dict[str, Any]) -> dict[str, str]:
+    """Path and download (modification) time of the file a source loads.
+
+    Empty when the file can't be resolved, e.g. for a source read from a
+    directory of snapshots.
+    """
+    try:
+        raw_path = _resolve_config_path(source_cfg["path"], default_base=RAW_DATA_DIR)
+        path = resolve_newest_matching_path(raw_path, stem_contains=source_cfg.get("stem_contains"))
+        modified = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+    except (OSError, ValueError, KeyError):
+        return {}
+    return {"path": str(path), "modified": modified.isoformat(timespec="seconds")}
+
+
 def _load_source(
     name: str,
     source_cfg: dict[str, Any],
@@ -840,6 +855,7 @@ def _process_impl(
     now = (as_of or datetime.now()).astimezone()
     logger.info(f"Counting gradebook items due by {now:%Y-%m-%d %H:%M %Z}")
     sources: dict[str, DataSource] = {}
+    source_files: dict[str, dict[str, str]] = {}
     gradebook_source: Optional[Gradebook] = None
     category_metadatas: dict[str, dict] = {}
 
@@ -851,6 +867,7 @@ def _process_impl(
             continue
         sources[src_name] = source
         category_metadatas[src_name] = cat_meta
+        source_files[src_name] = _source_file_info(src_cfg)
         if src_cfg.get("type") == "brightspace_gradebook":
             gradebook_source = source  # type: ignore[assignment]
 
@@ -929,6 +946,25 @@ def _process_impl(
 
         output_gb.to_csv(output_path)
         logger.success(f"Wrote engagement scores → {output_path}")
+        # When the scores were computed and what cutoff they used, for the
+        # "Last updated" stamp that upload-engagement adds to Brightspace.
+        metadata_path = output_path.with_suffix(".json")
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "computed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "as_of": now.isoformat(timespec="seconds"),
+                    # The oldest source download: the data is current as of then.
+                    "data_pulled_at": min(
+                        (f["modified"] for f in source_files.values() if "modified" in f),
+                        default=now.isoformat(timespec="seconds"),
+                    ),
+                    "sources": source_files,
+                    "csv": output_path.name,
+                },
+                indent=2,
+            )
+        )
 
         sample_rows = int(display_cfg.get("sample_rows", 0) or 0)
         if sample_rows > 0:

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Optional
 import json
@@ -48,6 +48,7 @@ from coursedata.config import (
     COURSE_NAME,
     TERM_NAME,
     DAILY_CONFIG,
+    ENGAGEMENT_CONFIG,
     GRADESCOPE_CONFIG,
     POLLEVERYWHERE_CONFIG,
     WEBASSIGN_CONFIG,
@@ -302,6 +303,103 @@ def post_gradescope_grades(
 
     if success == 0:
         raise typer.Exit(code=1)
+
+
+DEFAULT_ENGAGEMENT_STAMP = (
+    "<p><em>Last updated {updated:%a %b %-d, %Y, %-I:%M %p}. "
+    "This score is recalculated weekly from the data available then; it is not live.</em></p>"
+)
+POINTS_GRADE_SUFFIX = " Points Grade"
+
+
+def _newest_engagement_csv(output_template: str) -> Path:
+    """The newest engagement CSV matching the configured ``output_path`` (``{date}`` → any)."""
+    pattern = output_template.replace("{date}", "*")
+    base = Path(pattern) if Path(pattern).is_absolute() else PROCESSED_DATA_DIR / pattern
+    matches = sorted(base.parent.parent.glob(f"{base.parent.name}/{base.name}"))
+    if not matches:
+        raise FileNotFoundError(f"No engagement CSV matches {base}")
+    return matches[-1]
+
+
+def _engagement_grade_items(csv_path: Path) -> list[str]:
+    """Grade item names from a Brightspace import CSV's ``<item> Points Grade`` columns."""
+    columns = pd.read_csv(csv_path, nrows=0).columns
+    return [c.removesuffix(POINTS_GRADE_SUFFIX) for c in columns if c.endswith(POINTS_GRADE_SUFFIX)]
+
+
+@app.command("upload-engagement")
+def upload_engagement(
+    csv_path: Annotated[
+        Optional[Path],
+        typer.Option("--csv", help="Engagement CSV to upload (default: newest processed one)"),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Preview the import and the new descriptions without saving"),
+    ] = False,
+    headless: Annotated[
+        bool,
+        typer.Option("--headless/--headed", help="Run browser headless or headed (debugging)"),
+    ] = True,
+):
+    """Import engagement scores into Brightspace and stamp their descriptions.
+
+    Uses ``[tool.coursedata.engagement.upload]``: ``course`` (Brightspace ou),
+    optional ``stamp`` (HTML; ``{updated}`` is the time the scores were computed
+    for), ``marker`` (text that starts the stamp, default "Last updated") and
+    ``max_age_hours`` (default 24; older scores are not uploaded). Descriptions
+    are only stamped after the grades are imported.
+    """
+    if not BRIGHTSPACE_AVAILABLE:
+        logger.error("edubag Brightspace module is not available.")
+        raise typer.Exit(code=1)
+    upload_cfg = ENGAGEMENT_CONFIG.get("upload", {})
+    course = upload_cfg.get("course")
+    if not course:
+        logger.error("Set course in [tool.coursedata.engagement.upload] in pyproject.toml.")
+        raise typer.Exit(code=1)
+
+    if csv_path is None:
+        csv_path = _newest_engagement_csv(
+            ENGAGEMENT_CONFIG.get("output_path", "brightspace/grades/{date}/engagement.csv")
+        )
+    metadata_path = csv_path.with_suffix(".json")
+    if not metadata_path.exists():
+        logger.error(f"{metadata_path} not found; rerun `python -m coursedata.dataset process engagement`.")
+        raise typer.Exit(code=1)
+    metadata = json.loads(metadata_path.read_text())
+    updated = datetime.fromisoformat(metadata.get("data_pulled_at") or metadata["as_of"])
+    computed = datetime.fromisoformat(metadata["computed_at"])
+    max_age = timedelta(hours=float(upload_cfg.get("max_age_hours", 24)))
+    if datetime.now().astimezone() - computed > max_age:
+        logger.error(f"{csv_path} was computed {computed:%Y-%m-%d %H:%M}, over {max_age} ago; not uploading.")
+        raise typer.Exit(code=1)
+
+    names = _engagement_grade_items(csv_path)
+    marker = upload_cfg.get("marker", "Last updated")
+    stamp = upload_cfg.get("stamp", DEFAULT_ENGAGEMENT_STAMP).format(updated=updated)
+    logger.info(f"Uploading {csv_path} ({len(names)} grade items) to Brightspace course {course}")
+
+    client = BrightspaceClient()
+    try:
+        result = client.import_grades(course, csv_path, headless=headless, dry_run=dry_run)
+    except LookupError as e:
+        logger.error(f"Import failed: {e}")
+        raise typer.Exit(code=1) from e
+    logger.success(f"Import {result['status']}: {result['students']} students; changed {result['changed']}")
+
+    results = client.stamp_grade_item_descriptions(
+        course, names, stamp, marker=marker, headless=headless, dry_run=dry_run
+    )
+    for name, r in results.items():
+        logger.info(f"  {r['status']:>9}  {name}" + (f" ({r['error']})" if "error" in r else ""))
+    if any(r["status"] == "failed" for r in results.values()):
+        raise typer.Exit(code=1)
+    if dry_run:
+        logger.info(f"Dry run: nothing saved. Stamp would be: {stamp}")
+    else:
+        logger.success(f"Descriptions stamped: {stamp}")
 
 
 @app.command("sync-polleverywhere-assignments")
